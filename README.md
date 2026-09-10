@@ -1,4 +1,4 @@
-# Kimura v3.0 (MS-4300WG) — Unofficial Linux & macOS Driver
+#Kimura v3.0 (MS-4300WG) — Unofficial Linux & macOS Driver
 
 A community, user-space configuration tool for the **Zeroground Kimura v3.0
 (MS-4300WG)** gaming mouse, for Linux and macOS.
@@ -78,3 +78,4 @@ this repository.
 Use at your own risk. Some write operations documented here are not fully
 verified against real hardware — see `phase-a/README.md` for exactly what
 is confirmed versus experimental before using any write command.
+
