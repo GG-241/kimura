@@ -60,6 +60,13 @@ phase-a/README.md     full usage instructions, all commands, safety notes
 phase-b/               Linux-only tooling used during protocol discovery
 ```
 
+## License
+
+Free for personal and noncommercial use under the [PolyForm Noncommercial
+License 1.0.0](LICENSE). If Zeroground, a retailer, or anyone else wants to
+bundle this code or use it to build an official driver, please open an
+issue on this repository to discuss a commercial license.
+
 ## Disclaimer
 
 This is an independent, unofficial project, not affiliated with or
