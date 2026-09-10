@@ -1,23 +1,9 @@
-# Vendor assets — not to be redistributed (see README.md disclaimer)
-*.msi
-driveres_kimura30.zip
-
-# Raw USB capture files — large, and not needed to use or build on the driver
-wireshark_capture/
-*.pcap
-*.pcapng
-
-# Deep reverse-engineering research docs / internal working notes — kept
-# locally, not part of the public-facing project
-CLAUDE.md
-KIMURA_RE_STRATEGY.md
-phase-a/PROTOCOL.md
-phase-b/EMPIRICAL_DISCOVERY.md
-phase-b/USB_SNIFFING_GUIDE.md
-phase-b/UBUNTU_SETUP.txt
-phase-b/findings.jsonl
-
 # OS / editor junk
 .DS_Store
 __pycache__/
 *.pyc
+
+# Python packaging build artifacts
+build/
+dist/
+*.egg-info/

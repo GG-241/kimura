@@ -3,8 +3,8 @@
 kimura.py — portable probe/transport for the Zeroground Kimura v3.0 (MS-4300WG)
 gaming mouse, VID 0x248A / PID 0x5B49 (wired) or 0x5B4A (2.4 GHz receiver).
 
-Protocol reverse engineered from the vendor's Windows utility GamingMouse.exe.
-See PROTOCOL.md for the derivation.
+Protocol reverse engineered independently from the vendor's Windows utility,
+for interoperability (see README.md).
 
 READ-ONLY BY DEFAULT. Nothing in the default code path modifies the device.
 Write commands exist but are gated behind --allow-write, and the flash-commit

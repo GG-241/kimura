@@ -1,4 +1,4 @@
-#Kimura v3.0 (MS-4300WG) — Unofficial Linux & macOS Driver
+# Kimura v3.0 (MS-4300WG) — Unofficial Linux & macOS Driver
 
 A community, user-space configuration tool for the **Zeroground Kimura v3.0
 (MS-4300WG)** gaming mouse, for Linux and macOS.
@@ -16,49 +16,86 @@ No kernel driver is required. The mouse is a standard USB HID device —
 This tool is a small user-space client that speaks the vendor's own
 configuration protocol over that existing HID connection.
 
-## What works today
-
-- **LED control** — all 7 named presets (Neon, Colour Streaming, Breathing,
-  Colorful tail, Wave, Stars Twinkle, LED Off), plus additional presets
-  found during testing.
-- **Button/scroll reading** — live, read-only.
-- **Button remapping** — implemented, but marked experimental; see the
-  warnings in `phase-a/README.md` before using it.
-- **DPI** — the mouse's physical DPI button is confirmed to work at the
-  hardware level, but there does not appear to be a software DPI-set
-  command in this protocol at all (the vendor GUI's own "DPI" slider writes
-  nothing to the device — see `phase-a/README.md` for detail). Practically,
-  DPI stage is changed with the button on the mouse itself, same as with no
-  driver installed.
-
-## Requirements
+## Install
 
 ```bash
-brew install hidapi        # macOS
-pip install hidapi          # or: pip3 install hidapi --break-system-packages (Ubuntu/Debian)
+git clone https://github.com/GG-241/kimura.git
+cd kimura
+./install.sh
 ```
 
-Linux also needs a udev rule for USB device access — see
-`phase-a/README.md`.
+`install.sh` installs the `hidapi` dependency (via Homebrew on macOS), pip
+installs this package, and on Linux prints the one-time udev rule setup
+needed for USB access.
 
-## Quick start
+Or install directly with pip:
 
 ```bash
-python3 phase-a/kimura.py list                 # confirm the mouse is detected
-python3 phase-a/kimura.py probe --read-all     # confirm the transport works
-python3 phase-a/kimura.py led off --allow-write
-python3 phase-a/kimura.py buttons              # watch clicks/scroll live
+pip install git+https://github.com/GG-241/kimura.git
 ```
 
-Full usage, all commands, and safety notes: **`phase-a/README.md`**.
+## Usage
 
-## Project layout
+```bash
+kimura list                 # confirm the mouse is detected
+kimura probe --read-all     # confirm the transport works
+kimura led off --allow-write
+kimura led default --allow-write
+kimura buttons              # watch clicks/scroll live, read-only
+```
+
+### LED control (write, gated)
+
+`kimura led <preset>` sends a confirmed LED preset — accepts a hex byte
+(`0x00`-`0x1B`) or an alias (`off`, `default`, `breathing`). Requires
+`--allow-write`; refuses anything outside the confirmed-safe table.
+
+### Button remapping (write, EXPERIMENTAL)
+
+`kimura remap` writes the button-remap table. **This has not been verified
+against real hardware** — it's built from observing the vendor GUI's own
+USB traffic, not independently replayed. Requires both `--allow-write` and
+`--experimental`, and confirms interactively before sending unless `--yes`
+is passed:
+
+```bash
+kimura remap --button6 lock_pc --allow-write --experimental
+```
+
+Each of `--left`/`--right`/`--middle`/`--side-back`/`--side-forward`/
+`--button6` accepts an action name (`left_click`, `middle_click`, `back`,
+`forward`, `show_desktop`, `lock_pc`, `switch_apps`, `volume_down`,
+`scroll_up_or_volume_up`, `dpi_cycle`) or a raw `"XX XX XX XX"` hex code.
+
+**Important:** there's no confirmed way to read the mouse's current button
+table back, so any slot you don't specify is reset to its factory default —
+this can silently undo other customization. Physically test every remapped
+button afterward.
+
+### DPI
+
+The mouse's physical DPI button works at the hardware level, but there does
+not appear to be a software DPI-set command in this protocol — the vendor
+GUI's own "DPI" slider was observed writing nothing to the device. DPI
+stage is changed with the button on the mouse itself, same as with no
+driver installed.
+
+## Platform notes
+
+**macOS.** The OS refuses to open top-level Generic Desktop mouse/keyboard
+collections — `kimura` tries vendor-defined collections first. If every
+interface fails to open, that's the OS restriction, not a bug.
+
+**Linux.** Needs a udev rule for USB access (handled by `install.sh`, or
+manually):
 
 ```
-phase-a/kimura.py     the driver itself — portable, macOS + Linux
-phase-a/README.md     full usage instructions, all commands, safety notes
-phase-b/               Linux-only tooling used during protocol discovery
+# /etc/udev/rules.d/71-kimura-usb.rules
+SUBSYSTEM=="usb", ATTRS{idVendor}=="248a", ATTRS{idProduct}=="5b49", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="248a", ATTRS{idProduct}=="5b4a", MODE="0660", TAG+="uaccess"
 ```
+
+Then `sudo udevadm control --reload && sudo udevadm trigger` and replug the mouse.
 
 ## License
 
@@ -75,7 +112,5 @@ traffic and the official Windows utility's behavior, for the sole purpose
 of interoperability. No vendor code, binaries, or assets are included in
 this repository.
 
-Use at your own risk. Some write operations documented here are not fully
-verified against real hardware — see `phase-a/README.md` for exactly what
-is confirmed versus experimental before using any write command.
-
+Use at your own risk. The `remap` command in particular is not fully
+verified against real hardware — read its section above before using it.
