@@ -249,6 +249,17 @@ class Kimura:
             time.sleep(SETTLE)
         return out
 
+    def read_dpi_stage(self):
+        """Opcode 0x82 — CONFIRMED read-only DPI stage indicator
+        (PROTOCOL.md §2.3/§4.1): response byte 0 (buffer offset 2) is the
+        current DPI stage, 0-5, cycling with the physical DPI button. Purely
+        a read, changes nothing. Returns None on failure."""
+        try:
+            rx = self.command(0x82)
+        except KimuraError:
+            return None
+        return rx[2] if len(rx) > 2 else None
+
     def set_led(self, preset):
         """Opcode 0x03, 1-byte payload — CONFIRMED LED preset selector
         (PROTOCOL.md §4.3). preset must be in LED_PRESETS (0x00-0x1B); 0xFF
@@ -602,6 +613,44 @@ def decode_mouse_report(data):
     return buttons, bits_set, dx, dy, wheel
 
 
+def read_battery(dev):
+    """Read the Feature report_id=5 channel on interface 0 (usage_page
+    0xFF00 — a second, separate vendor channel from the main command
+    channel at interface 1/report_id=7/usage_page 0xFF01). `dev` must
+    already be open on interface 0 — the same handle
+    open_generic_mouse_collection() returns.
+
+    UNCONFIRMED (found 2026-09-15): byte 1 of the response is a strong
+    candidate for battery percentage — stable across repeated reads, and in
+    the plausible 0-100 range (observed 0x58 = 88). Not yet independently
+    cross-checked against the vendor GUI or an actual charge-level change;
+    treat the returned value as a best guess, not a confirmed reading.
+    Returns None if the read fails or the response is too short.
+    """
+    try:
+        data = dev.get_feature_report(5, 8)
+    except Exception:
+        return None
+    if len(data) < 2:
+        return None
+    return data[1]
+
+
+def cmd_battery(args):
+    dev, d = open_generic_mouse_collection()
+    if not dev:
+        print("Could not open the standard mouse Input-report collection "
+              "(same one `buttons` needs) — battery is read through it.")
+        return 1
+    pct = read_battery(dev)
+    dev.close()
+    if pct is None:
+        print("Could not read the battery channel.")
+        return 1
+    print("Battery: ~%d%% (UNCONFIRMED reading — see read_battery() docstring)" % pct)
+    return 0
+
+
 def cmd_buttons(args):
     dev, d = open_generic_mouse_collection()
     if not dev:
@@ -672,6 +721,9 @@ def main():
 
     pb = sub.add_parser("buttons", help="watch button/scroll Input reports (read-only)")
     pb.set_defaults(func=cmd_buttons)
+
+    pbat = sub.add_parser("battery", help="read battery level (read-only, UNCONFIRMED)")
+    pbat.set_defaults(func=cmd_battery)
 
     prm = sub.add_parser("remap",
         help="EXPERIMENTAL: write the button-remap table (write, gated, unverified on real hardware)")

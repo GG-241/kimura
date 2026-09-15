@@ -9,10 +9,15 @@ description = "Unofficial cross-platform (Linux/macOS) configuration tool for th
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.7"
-dependencies = ["hidapi"]
+dependencies = ["hidapi", "customtkinter", "Pillow", "pystray"]
 
 [project.scripts]
 kimura = "kimura:main"
+kimura-gui = "kimura_gui:main"
 
 [tool.setuptools]
-py-modules = ["kimura"]
+py-modules = ["kimura", "kimura_gui", "kimura_tray"]
+packages = ["kimura_assets"]
+
+[tool.setuptools.package-data]
+kimura_assets = ["*.webp"]

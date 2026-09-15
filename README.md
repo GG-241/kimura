@@ -25,8 +25,26 @@ cd kimura
 ```
 
 `install.sh` installs the `hidapi` dependency (via Homebrew on macOS), pip
-installs this package, and on Linux prints the one-time udev rule setup
-needed for USB access.
+installs this package, sets up desktop integration (a "Kimura GUI.app" in
+`~/Applications` on macOS, an application-menu entry on Linux), and on
+Linux also prints the one-time udev rule setup needed for USB access.
+
+### Standalone builds (no Python/pip needed)
+
+Prefer a single file you can just run? Build one yourself:
+
+```bash
+bash packaging/build_appimage.sh   # Linux -> dist/Kimura-GUI-x86_64.AppImage
+bash packaging/build_dmg.sh        # macOS -> dist/Kimura-GUI.dmg (run on a Mac)
+```
+
+Both scripts use a throwaway venv + PyInstaller and don't touch your normal
+Python environment. The AppImage is confirmed working (built and tested in
+this project's own dev environment, including talking to real hardware).
+The DMG script follows the same recipe and includes a self-check step, but
+hasn't been run on real macOS yet — report back if anything needs
+adjusting. Neither is code-signed, so macOS Gatekeeper will require
+right-click → Open on first launch.
 
 Or install directly with pip:
 
@@ -34,7 +52,38 @@ Or install directly with pip:
 pip install git+https://github.com/GG-241/kimura.git
 ```
 
-## Usage
+## GUI
+
+```bash
+kimura-gui
+```
+
+Or launch "Kimura GUI" from your Applications folder (macOS) or application
+menu (Linux) after running `install.sh`. Needs `tkinter` — usually already
+present, but if not: `sudo apt install python3-tk` (Linux) or
+`brew install python-tk` (macOS). Four tabs, plus a live battery reading in
+the top bar:
+
+- **Device** — live status, battery (see below), Refresh button
+- **LED** — pick a preset from the dropdown, Apply
+- **Button Remap** (experimental) — same write path and same caveats as
+  `kimura remap` below, with a confirmation dialog before sending; shows
+  the real mouse photo with numbered markers for each slot
+- **Live (read-only)** — button/scroll indicator
+
+**Battery** is read from a previously-undocumented Feature channel and is
+**unconfirmed** — a stable, plausible-range value, not yet independently
+cross-checked. Treat it as a best guess (`kimura battery` on the CLI, or the
+top bar in the GUI).
+
+**System tray icon** (optional): shows connection/battery/DPI-stage status
+in a click menu, with checkable toggles for what appears in the hover
+tooltip. The GUI works fine without it; on Ubuntu/GNOME it needs:
+```bash
+sudo apt install gir1.2-ayatanaappindicator3-0.1
+```
+
+## CLI Usage
 
 ```bash
 kimura list                 # confirm the mouse is detected
