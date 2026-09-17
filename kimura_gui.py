@@ -113,6 +113,7 @@ class KimuraGUI(ctk.CTk):
 
         self.refresh_device()
         self._last_dpi_poll = 0.0
+        self._last_tray_poll = 0.0
         self.after(POLL_MS, self._poll_input)
 
     # -- overall layout ---------------------------------------------------
@@ -438,6 +439,14 @@ class KimuraGUI(ctk.CTk):
         if self.dev and now - self._last_dpi_poll > 2.0:
             self._last_dpi_poll = now
             self._tray_state.dpi_stage = self.dev.read_dpi_stage()
+
+        # macOS tray is redrawn from this (main) thread — on darwin,
+        # kimura_tray attaches a refresh hook to the icon instead of running
+        # thread, because pystray's AppKit setters may only be touched from
+        # the main thread (see kimura_tray.py).
+        if self._tray_icon and now - self._last_tray_poll > 1.0:
+            self._last_tray_poll = now
+            getattr(self._tray_icon, "_kimura_refresh", lambda: None)()
 
         self._drain_tray_queue()
         if not self._closed:

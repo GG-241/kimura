@@ -41,9 +41,10 @@ bash packaging/build_dmg.sh        # macOS -> dist/Kimura-GUI.dmg (run on a Mac)
 Both scripts use a throwaway venv + PyInstaller and don't touch your normal
 Python environment. The AppImage is confirmed working (built and tested in
 this project's own dev environment, including talking to real hardware).
-The DMG script follows the same recipe and includes a self-check step, but
-hasn't been run on real macOS yet — report back if anything needs
-adjusting. Neither is code-signed, so macOS Gatekeeper will require
+The DMG is confirmed working on Apple Silicon (verified on real macOS with
+brew's Python 3.13 + `python-tk@3.13`). It needs a Python >= 3.12 — older
+python.org 3.11.x builds have a tkinter bug that intermittently crashes
+the GUI. Neither build is code-signed, so macOS Gatekeeper will require
 right-click → Open on first launch.
 
 Or install directly with pip:

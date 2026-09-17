@@ -12,3 +12,4 @@ dist/
 .dmg-build-venv/
 packaging/AppDir/
 packaging/appimagetool.AppImage
+packaging/kimura-gui.icns

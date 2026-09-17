@@ -20,6 +20,7 @@ before giving up and disabling itself.
 
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -46,6 +47,15 @@ except Exception:
         TRAY_AVAILABLE = True
     except Exception:
         TRAY_AVAILABLE = False
+
+if TRAY_AVAILABLE:
+    # Eagerly load the PIL codecs that Image.save() would otherwise import
+    # lazily on first use. pystray's macOS backend serialises the tray icon
+    # to PNG (Image.save -> _assert_image) on its background threads, and a
+    # lazy import there can race the main thread's garbage collector and
+    # SIGABRT the process in frozen (PyInstaller) builds — so load them all
+    # here, on the main thread, before any tray thread exists.
+    from PIL import BmpImagePlugin, GifImagePlugin, JpegImagePlugin, PngImagePlugin, PpmImagePlugin  # noqa: F401
 
 
 class TrayState:
@@ -128,19 +138,46 @@ def start_tray(state, show_callback, quit_callback):
 
     icon = pystray.Icon("kimura-gui", make_icon_image(), "Kimura", menu)
 
-    def refresh_loop():
-        last_connected = None
-        while True:
-            try:
-                if icon.visible:
-                    if state.connected != last_connected:
-                        icon.icon = make_icon_image()
-                        last_connected = state.connected
-                    icon.title = tooltip_text()
-            except Exception:
-                pass
-            time.sleep(1.0)
+    def refresh_once():
+        try:
+            if icon.visible:
+                if state.connected != refresh_once.last_connected:
+                    icon.icon = make_icon_image()
+                    refresh_once.last_connected = state.connected
+                icon.title = tooltip_text()
+        except Exception:
+            pass
 
-    threading.Thread(target=refresh_loop, daemon=True).start()
-    threading.Thread(target=icon.run, daemon=True).start()
+    refresh_once.last_connected = None
+
+    if sys.platform == "darwin":
+        # macOS: pystray's AppKit backend must not be run() on a background
+        # thread — AppKit UI is main-thread only, and creating the status
+        # item off it SIGABRTs the whole process. run_detached() creates
+        # the status item right here on the caller's (Tk main) thread
+        # instead; Tk's mainloop then pumps the NSApplication events the
+        # menu needs.
+        #
+        # The no-op setup matters: pystray's default setup would flip
+        # visible = True on its own background thread, which runs _show()
+        # (AppKit + PIL) off the main thread. Show the icon here instead.
+        #
+        # Tray redraws are also main-thread work: refresh_once() touches
+        # icon.icon/icon.title (AppKit setters), and calling that from a
+        # background thread races the main thread's garbage collector and
+        # intermittently SIGABRTs. So no refresh thread here — start_tray
+        # attaches refresh_once to the icon, and kimura_gui's poll loop
+        # (Tk main thread) calls it about once a second. Everything pystray
+        # touches stays on the main thread.
+        icon.run_detached(setup=lambda _icon: None)
+        icon.visible = True
+        icon._kimura_refresh = refresh_once
+    else:
+        def refresh_loop():
+            while True:
+                refresh_once()
+                time.sleep(1.0)
+
+        threading.Thread(target=refresh_loop, daemon=True).start()
+        threading.Thread(target=icon.run, daemon=True).start()
     return icon
