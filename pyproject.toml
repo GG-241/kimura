@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kimura-driver"
+version = "1.1.0"
+description = "Unofficial cross-platform (Linux/macOS) configuration tool for the Zeroground Kimura v3.0 (MS-4300WG) gaming mouse"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.7"
+dependencies = ["hidapi", "customtkinter", "Pillow", "pystray", "pyusb"]
+
+[project.scripts]
+kimura = "kimura:main"
+kimura-gui = "kimura_gui:main"
+
+[tool.setuptools]
+py-modules = ["kimura", "kimura_gui", "kimura_tray"]
+packages = ["kimura_assets"]
+
+[tool.setuptools.package-data]
+kimura_assets = ["*.webp"]
