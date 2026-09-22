@@ -16,12 +16,14 @@ if [ ! -d "$VENV" ]; then
     python3 -m venv "$VENV"
 fi
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet pyinstaller hidapi customtkinter Pillow pystray
+"$VENV/bin/pip" install --quiet pyinstaller hidapi customtkinter Pillow pystray pyusb
 
 rm -rf build dist kimura-gui.spec packaging/AppDir
 "$VENV/bin/python3" -m PyInstaller --onefile --windowed --name kimura-gui \
+    --collect-all hidapi \
     --collect-all customtkinter \
     --collect-all pystray \
+    --collect-all usb \
     --collect-data kimura_assets --hidden-import kimura_assets --hidden-import PIL._tkinter_finder \
     kimura_gui.py
 

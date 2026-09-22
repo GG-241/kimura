@@ -65,8 +65,12 @@ present, but if not: `sudo apt install python3-tk` (Linux) or
 `brew install python-tk` (macOS). Four tabs, plus a live battery reading in
 the top bar:
 
-- **Device** — live status, battery (see below), Refresh button
-- **LED** — pick a preset from the dropdown, Apply
+- **Device** — live status, battery (see below), a Mouse Details panel
+  (connection type, PID/interface/path, DPI stage, and the raw diagnostic
+  block dump — see "Mouse details" below), Refresh button, and Factory
+  Reset
+- **LED** — pick a preset from the dropdown, Apply (persists to flash by
+  default — see LED control above)
 - **Button Remap** (experimental) — same write path and same caveats as
   `kimura remap` below, with a confirmation dialog before sending; shows
   the real mouse photo with numbered markers for each slot
@@ -89,16 +93,48 @@ sudo apt install gir1.2-ayatanaappindicator3-0.1
 ```bash
 kimura list                 # confirm the mouse is detected
 kimura probe --read-all     # confirm the transport works
-kimura led off --allow-write
-kimura led default --allow-write
+kimura details              # connection type, DPI stage, battery, raw diagnostics
+kimura led off --allow-write --persist
+kimura led default --allow-write --persist
 kimura buttons              # watch clicks/scroll live, read-only
+kimura factory-reset --allow-write
 ```
+
+### Mouse details (read-only)
+
+`kimura details` (and the GUI's Device page) shows connection type
+(wired/2.4GHz, from the PID) alongside the raw USB product string, the
+interface/path in use, current DPI stage, battery, and a raw dump of the
+vendor read-all-blocks sequence (`0x81`/`0x86`/`0x82`/`0x83`/`0x84`) for
+diagnostics — several of those opcodes' meanings are still unconfirmed
+(see `phase-a/PROTOCOL.md` §5), so treat the raw block values as
+diagnostic, not a documented API.
 
 ### LED control (write, gated)
 
 `kimura led <preset>` sends a confirmed LED preset — accepts a hex byte
 (`0x00`-`0x1B`) or an alias (`off`, `default`, `breathing`). Requires
 `--allow-write`; refuses anything outside the confirmed-safe table.
+
+By default this is a **live preview only** — it changes the LED instantly
+but reverts on replug or power-cycle, because the real vendor driver never
+sends the LED opcode on its own; it's always one step inside an 11-command
+bundle that ends with a flash commit (confirmed byte-for-byte from a USB
+capture of the vendor GUI, see `phase-a/PROTOCOL.md` §4.3a). Pass
+`--persist` to send that full bundle and make the change stick. Since
+there's no confirmed way to read the mouse's current button table back,
+`--persist` also resends it — any button slot you haven't customized via
+`kimura remap` in the same session gets (re)set to its factory default.
+The GUI's LED page always persists, with the same caveat shown before Apply.
+
+### Factory Reset (write, gated)
+
+`kimura factory-reset` restores the button table (left/right/middle click,
+back/forward, underside = DPI cycle) and LED (Neon) to their factory
+defaults in one flash commit — the same confirmed bundle `--persist`
+above uses, with no overrides. Requires `--allow-write` and typing
+`RESTORE` to confirm (skip the prompt with `--yes`). Also available from
+the GUI's Device page.
 
 ### Button remapping (write, EXPERIMENTAL)
 
@@ -136,6 +172,15 @@ driver installed.
 collections — `kimura` tries vendor-defined collections first. If every
 interface fails to open, that's the OS restriction, not a bug.
 
+Separately, `--persist`, `remap`, and `factory-reset` (anything that writes
+the 32-byte button/LED table) do not work on macOS at all: this firmware
+only accepts that data via a control-plane USB request, and macOS's IOKit
+HID stack cannot issue one for this device from userspace (confirmed three
+independent ways — hidapi, direct IOKit, and libusb all fail). `kimura`
+detects this and refuses immediately with a clear error instead of hanging;
+there is no known macOS workaround. The single-opcode, non-persistent
+`kimura led <preset>` (no `--persist`) is unaffected and still works.
+
 **Linux.** Needs a udev rule for USB access (handled by `install.sh`, or
 manually):
 
@@ -146,6 +191,46 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="248a", ATTRS{idProduct}=="5b4a", MODE="0660"
 ```
 
 Then `sudo udevadm control --reload && sudo udevadm trigger` and replug the mouse.
+
+The 32-byte button/LED table writes used by `--persist`, `remap`, and
+`factory-reset` need a **control-plane** USB request on the vendor
+interface (confirmed interface 1) — its interrupt-OUT endpoint is declared
+but not wired to page storage. `kimura` sends these via `pyusb`/libusb
+directly rather than hidapi's `write()`, which CONFIRMED (real hardware,
+2026-09-22) is unreliable here two different ways: on whichever interface
+happens to host the Feature-command session it can return "success" while
+firmware silently discards the packet (wrong interface), and on the
+correct interface its own interrupt-OUT endpoint isn't serviced at all
+(fails outright). The control-plane write briefly detaches the kernel's
+`usbhid` driver from *just* the vendor interface for the duration of each
+transfer and reattaches it immediately after — no extra udev rule beyond
+the one above (`uaccess` already covers `/dev/bus/usb/*`), and this
+doesn't disturb the Feature-command session, which normally lives on a
+different interface.
+
+## Dependencies
+
+Both `kimura` (CLI) and `kimura-gui` check their dependencies on startup and
+exit with a clear, actionable message (which package/command to run) instead
+of a raw traceback if something's missing — `hid`/`hidapi`, and for the GUI
+also `tkinter`, `customtkinter`, and `Pillow`. `pyusb` (needed on Linux for
+button/LED-persist/factory-reset writes — see Platform notes above) and the
+system tray's `pystray` are checked lazily, only when actually used/started,
+and degrade with a clear error or a silent no-tray fallback respectively
+rather than crashing the app.
+
+The standalone AppImage/DMG builds bundle all of these already (see
+Standalone builds above), so this mainly matters if you're running from
+source or via `pip install`.
+
+## Reporting issues
+
+Found a bug, a crash, or something that doesn't match this README?
+[Open an issue on GitHub](https://github.com/GG-241/kimura/issues/new) —
+both the CLI (`--help`) and the GUI (top bar, "Report an Issue") link here
+too. Useful details to include: your OS, how you installed (AppImage/DMG/
+pip/source), the exact command or button you used, and the full error
+text if there was one.
 
 ## License
 

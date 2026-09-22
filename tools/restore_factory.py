@@ -16,8 +16,7 @@ import kimura as k  # noqa: E402
 
 def find_transport():
     cands = k.enumerate_candidates(verbose=False)
-    vendor = [d for d in cands if k.is_vendor_collection(d)]
-    for d in vendor + [x for x in cands if x not in vendor]:
+    for d in k.order_candidates(cands):
         kk = k.probe(d, k.DEFAULT_REPORT_IDS, k.DEFAULT_LENGTHS, verbose=False)
         if kk:
             return kk

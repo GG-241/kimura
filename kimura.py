@@ -27,6 +27,16 @@ except ImportError:
 VID = 0x248A
 PIDS = (0x5B49, 0x5B4A)
 
+# Per the vendor's own PID split (README.md/CLAUDE.md). NOTE: at least one
+# real unit's own USB product string ("Wireless Receiver") doesn't match
+# this PID's documented "wired" label — treat this as the best available
+# guess, not authoritative; the GUI/CLI show the raw product string too.
+CONNECTION_TYPES = {0x5B49: "Wired", 0x5B4A: "2.4GHz Wireless Receiver"}
+
+
+def connection_type(pid):
+    return CONNECTION_TYPES.get(pid, "Unknown (PID 0x%04X)" % pid)
+
 # --- opcodes (see PROTOCOL.md §4) -------------------------------------------
 OP_VERSION = 0x80  # CONFIRMED NON-FUNCTIONAL on real hardware (PROTOCOL.md §5):
                    # returns a fixed value regardless of input, never echoes.
@@ -169,6 +179,69 @@ class KimuraError(Exception):
     pass
 
 
+VENDOR_OUTPUT_INTERFACE = 1  # see _control_plane_output_write()'s docstring
+
+
+def _control_plane_output_write(vid, pid, buf):
+    """Send `buf` (report_id + 32 payload bytes) as a HID class SET_REPORT
+    control transfer (bmRequestType 0x21, bRequest 0x09, wValue 0x02<<8 |
+    report_id, wIndex=VENDOR_OUTPUT_INTERFACE) via pyusb/libusb, instead of
+    hidapi's interrupt-OUT write() — see _tx_output()'s docstring for why.
+
+    CONFIRMED (real hardware + usbmon capture, 2026-09-22): always targets
+    interface 1 specifically, regardless of which interface hosts this
+    object's Feature-command session (often interface 0 — see
+    order_candidates()'s docstring). Sending the Output report via any
+    OTHER interface's endpoint gets silently ACKed by the USB stack but
+    discarded by firmware — this is the exact bug that made an earlier,
+    interface-agnostic version of this write path look like it worked
+    (returned success) while never actually updating the button table.
+
+    Interface 1 is normally claimed by the kernel's usbhid driver, so this
+    detaches it just for interface 1 (leaving any other open interface —
+    e.g. this object's own Feature-command handle, if it's on a different
+    interface — untouched) for the duration of the transfer, then
+    reattaches it. No detach is needed/attempted if usbhid isn't currently
+    bound there.
+    """
+    try:
+        import usb.core
+    except ImportError:
+        raise KimuraError(
+            "control-plane fallback needs pyusb (pip install pyusb) — "
+            "there's no other way to send page data on Linux for this "
+            "firmware (its interrupt-OUT endpoint isn't serviced)")
+
+    report_id = buf[0]
+    devices = list(usb.core.find(idVendor=vid, idProduct=pid, find_all=True))
+    if not devices:
+        raise KimuraError("control-plane fallback: no USB device 0x%04X:0x%04X found"
+                          % (vid, pid))
+
+    errors = []
+    for dev in devices:
+        detached = False
+        try:
+            if dev.is_kernel_driver_active(VENDOR_OUTPUT_INTERFACE):
+                dev.detach_kernel_driver(VENDOR_OUTPUT_INTERFACE)
+                detached = True
+            n = dev.ctrl_transfer(
+                0x21, 0x09, (0x02 << 8) | report_id, VENDOR_OUTPUT_INTERFACE, buf)
+            if n == len(buf):
+                return
+            errors.append("ctrl_transfer wrote %d of %d bytes" % (n, len(buf)))
+        except Exception as e:
+            errors.append(str(e))
+        finally:
+            if detached:
+                try:
+                    dev.attach_kernel_driver(VENDOR_OUTPUT_INTERFACE)
+                except Exception:
+                    pass
+    raise KimuraError("control-plane fallback failed on every candidate device: %s"
+                      % "; ".join(errors))
+
+
 class Kimura:
     """Feature-report transport, mirroring the vendor tool's idiom exactly."""
 
@@ -195,14 +268,42 @@ class Kimura:
 
         Distinct from _tx()/command(), which use Feature reports. See
         PROTOCOL.md §2.2/§4.3a — this is the bulk-plane transport.
+
+        CONFIRMED this firmware only accepts page data via a control-plane
+        SET_REPORT on EP0 (bmRequestType 0x21, bRequest 0x09, wValue
+        0x0207, wIndex=VENDOR_OUTPUT_INTERFACE) — its interrupt-OUT
+        endpoints are declared in the descriptor but not serviced as page
+        storage. On macOS this is unreachable from userspace at all (IOKit
+        routes Output reports to an unserviced interrupt-OUT pipe and
+        hangs ~5s; direct libusb control transfers are denied while the
+        interface is claimed) — refuse immediately rather than hang the
+        caller (the GUI runs this on its single Tk thread).
+
+        On Linux, hidapi's interrupt-OUT write() is NOT used at all here,
+        deliberately — CONFIRMED (real hardware + usbmon capture,
+        2026-09-22) it's actively misleading: on the interface this
+        object's Feature session happens to be on, it can return "success"
+        while the firmware silently discards the packet (wrong interface's
+        endpoint); on the correct interface (1), the endpoint isn't
+        serviced at all and it fails outright. Either way its return value
+        isn't trustworthy, so this goes straight to the control-plane
+        route via pyusb/libusb, which targets interface 1 specifically.
         """
         if len(payload32) != 32:
             raise KimuraError("output report payload must be exactly 32 bytes, got %d"
                               % len(payload32))
         buf = bytes([self.report_id]) + bytes(payload32)
-        n = self.dev.write(buf)
-        if n is not None and n < 0:
-            raise KimuraError("output report write failed")
+
+        if sys.platform == "darwin":
+            raise KimuraError(
+                "page-data write refused on macOS: this firmware only accepts "
+                "button/LED table writes via a control-plane USB request, which "
+                "macOS's IOKit cannot issue from userspace for this device "
+                "(confirmed via hidapi, direct IOKit, and libusb — see README.md "
+                "Platform notes). This is an OS limitation, not a bug here; "
+                "retrying will not help.")
+
+        _control_plane_output_write(VID, self.info.get("product_id", 0), buf)
 
     def command(self, opcode, payload=b"", expect_reply=True):
         """Write a command; optionally read back and verify the opcode echo."""
@@ -260,18 +361,45 @@ class Kimura:
             return None
         return rx[2] if len(rx) > 2 else None
 
-    def set_led(self, preset):
+    def device_details(self):
+        """Read-only diagnostic snapshot for a UI/CLI 'details' view: the
+        vendor read-all-blocks sequence (raw, several opcodes still
+        unconfirmed — see OP_READ_BLOCKS/PROTOCOL.md) plus the DPI stage
+        decoded from it. Purely informational, changes nothing, and reuses
+        read_all_blocks() rather than a separate 0x82 round trip."""
+        blocks = self.read_all_blocks()
+        dpi_rx = blocks.get(0x82)
+        dpi_stage = (dpi_rx[2] if isinstance(dpi_rx, (bytes, bytearray)) and len(dpi_rx) > 2
+                     else None)
+        return {"blocks": blocks, "dpi_stage": dpi_stage}
+
+    def set_led(self, preset, persist=False):
         """Opcode 0x03, 1-byte payload — CONFIRMED LED preset selector
         (PROTOCOL.md §4.3). preset must be in LED_PRESETS (0x00-0x1B); 0xFF
-        is confirmed to crash the firmware and is never accepted here. No
-        echo check — this is the "short-command class", write-only.
+        is confirmed to crash the firmware and is never accepted here.
+
+        `persist=False` (default): a single bare Feature-report write, no
+        echo check. This changes the LED live but is **NOT** written to
+        flash — CONFIRMED (vendor-GUI USB capture, PROTOCOL.md §4.3a): the
+        real driver never sends a bare 0x03, only ever as step 6 of its
+        11-step apply bundle, ending in an 0xFA flash commit. Without that
+        commit, this reverts on replug/power-cycle.
+
+        `persist=True`: sends the full 11-step bundle via
+        apply_button_table() so the change survives replug/power-cycle —
+        inherits that method's caveat: since there's no read-back opcode
+        for the button table, this also resets any button remap to factory
+        defaults unless you pass explicit overrides of your own.
         """
         if preset not in LED_PRESETS:
             raise KimuraError(
                 "refusing to send unconfirmed LED preset 0x%02X — only %s "
                 "are confirmed safe (see PROTOCOL.md §4.3)"
                 % (preset, ", ".join("0x%02X" % p for p in sorted(LED_PRESETS))))
-        self.command(OP_LED, bytes([preset]), expect_reply=False)
+        if persist:
+            self.apply_button_table({}, led_preset=preset)
+        else:
+            self.command(OP_LED, bytes([preset]), expect_reply=False)
 
     def apply_button_table(self, overrides, led_preset=None):
         """EXPERIMENTAL — sends the full 11-step "apply settings" bundle
@@ -366,6 +494,30 @@ def is_vendor_collection(d):
     return up >= 0xFF00
 
 
+def order_candidates(cands):
+    """Order HID interface candidates, vendor-defined usage pages first.
+
+    Deliberately does NOT prefer interface_number == 1 (the real vendor/
+    page-data channel on the hardware characterized in PROTOCOL.md and
+    confirmed again via a 2026-09-22 usbmon capture) for the FEATURE-
+    command session: on real hardware this firmware answers Feature
+    SET_REPORT/GET_REPORT (ping, LED, page-select) identically regardless
+    of which interface's control endpoint receives the request, so
+    whichever interface answers first (often interface 0, when usage_page
+    is unreliable — see open_generic_mouse_collection()'s docstring for
+    the same Linux hidapi quirk) works fine for Feature commands. Output-
+    report (page-data) writes are handled entirely separately in
+    _tx_output()/_control_plane_output_write(), which always target
+    interface 1 explicitly via a dedicated pyusb/libusb claim — keeping
+    that claim off whatever interface this function's caller opens for
+    Feature commands avoids the two colliding (CONFIRMED: they do collide,
+    real hardware, 2026-09-22 — pyusb got EBUSY when the Feature session
+    was also forced onto interface 1).
+    """
+    vendor = [d for d in cands if is_vendor_collection(d)]
+    return vendor + [d for d in cands if d not in vendor]
+
+
 def probe(d, report_ids, lengths, verbose=True):
     """Try opcode 0x81 (OP_PING) across candidate (report_id, length) pairs.
 
@@ -406,7 +558,7 @@ def cmd_probe(args):
         return 1
 
     vendor = [d for d in cands if is_vendor_collection(d)]
-    order = vendor + [d for d in cands if d not in vendor]
+    order = order_candidates(cands)
     if vendor:
         print("Trying %d vendor-defined collection(s) first.\n" % len(vendor))
     else:
@@ -471,14 +623,66 @@ def cmd_led(args):
     if not cands:
         print("No 0x248A device found.")
         return 1
-    vendor = [d for d in cands if is_vendor_collection(d)]
-    order = vendor + [d for d in cands if d not in vendor]
+    order = order_candidates(cands)
+
+    if args.persist:
+        print("--persist: this also resends the button-remap table. Since there's")
+        print("no way to read the mouse's current table back first, any slots you")
+        print("haven't customized via `kimura remap` will be (re)set to factory")
+        print("defaults. See README.md before using.")
 
     for d in order:
         k = probe(d, DEFAULT_REPORT_IDS, DEFAULT_LENGTHS, verbose=False)
         if k:
-            k.set_led(preset)
-            print("Sent LED preset 0x%02X (%s)." % (preset, LED_PRESETS[preset]))
+            try:
+                k.set_led(preset, persist=args.persist)
+            except KimuraError as e:
+                print("Error: %s" % e)
+                k.dev.close()
+                return 3
+            print("Sent LED preset 0x%02X (%s)%s."
+                  % (preset, LED_PRESETS[preset], " and committed to flash" if args.persist else ""))
+            if not args.persist:
+                print("This is a live preview only — it will revert on replug/power-cycle.")
+                print("Pass --persist to make it stick.")
+            k.dev.close()
+            return 0
+    print("Could not establish transport — run `kimura.py probe` for diagnosis.")
+    return 2
+
+
+def cmd_factory_reset(args):
+    if not args.allow_write:
+        print("Refusing to write without --allow-write.")
+        return 1
+
+    print("This will flash:")
+    print("  - button table -> FACTORY (left/right/middle/back/forward click, "
+          "underside = DPI cycle)")
+    print("  - LED preset   -> 0x00 (Neon)")
+    print("  - one 0xFA flash commit")
+    if not args.yes:
+        answer = input("\nType RESTORE to proceed: ").strip()
+        if answer != "RESTORE":
+            print("Aborted — nothing written.")
+            return 1
+
+    cands = enumerate_candidates(verbose=False)
+    if not cands:
+        print("No 0x248A device found.")
+        return 1
+    order = order_candidates(cands)
+
+    for d in order:
+        k = probe(d, DEFAULT_REPORT_IDS, DEFAULT_LENGTHS, verbose=False)
+        if k:
+            try:
+                k.apply_button_table({}, led_preset=LED_ALIASES["default"])
+            except KimuraError as e:
+                print("Error: %s" % e)
+                k.dev.close()
+                return 3
+            print("Factory bundle applied. Physically verify every button and the LED now.")
             k.dev.close()
             return 0
     print("Could not establish transport — run `kimura.py probe` for diagnosis.")
@@ -544,8 +748,7 @@ def cmd_remap(args):
             return 1
 
     cands = enumerate_candidates(verbose=False)
-    vendor = [d for d in cands if is_vendor_collection(d)]
-    order = vendor + [d for d in cands if d not in vendor]
+    order = order_candidates(cands)
     for d in order:
         k = probe(d, DEFAULT_REPORT_IDS, DEFAULT_LENGTHS, verbose=False)
         if k:
@@ -562,15 +765,13 @@ def cmd_remap(args):
 BUTTON_NAMES = {0: "Left", 1: "Right", 2: "Middle", 3: "Back", 4: "Forward"}
 
 
-def open_generic_mouse_collection(verbose=True):
-    """Open the STANDARD (non-vendor) mouse collection for reading Input
-    reports (buttons/scroll) — report_id=1, per PROTOCOL.md §2.3. This is
-    deliberately separate from the vendor-channel discovery in probe(),
-    which targets usage_page >= 0xFF00.
-
-    macOS refuses to open top-level Generic Desktop mouse/keyboard
-    collections (see README.md platform notes) — this may simply fail to
-    find anything there; that is an OS restriction, not a bug here.
+def pick_generic_candidate(cands):
+    """Pick the STANDARD (non-vendor) mouse collection candidate — Input
+    reports (buttons/scroll), report_id=1, per PROTOCOL.md §2.3 — without
+    opening anything. Shared by open_generic_mouse_collection() and by
+    callers that need to detect a same-interface collision with the
+    vendor channel (some units expose both on the same candidate) before
+    deciding whether to open a second handle or reuse an existing one.
 
     CONFIRMED (real hardware, Linux): this backend's usage_page field is
     unreliable — `list` shows 0x0000 for every interface here even though
@@ -581,21 +782,34 @@ def open_generic_mouse_collection(verbose=True):
     == 0 when every candidate reports usage_page 0 — don't just silently
     match nothing.
     """
-    cands = enumerate_candidates(verbose=False)
     generic = [d for d in cands
-               if not is_vendor_collection(d) and (d.get("usage_page") or 0) == 0x0001]
+              if not is_vendor_collection(d) and (d.get("usage_page") or 0) == 0x0001]
     if not generic:
         generic = [d for d in cands if d.get("interface_number") == 0]
-    for d in generic:
+    return generic[0] if generic else None
+
+
+def open_generic_mouse_collection(verbose=True):
+    """Open the STANDARD (non-vendor) mouse collection for reading Input
+    reports — see pick_generic_candidate() for the selection logic. This
+    is deliberately separate from the vendor-channel discovery in probe(),
+    which targets usage_page >= 0xFF00.
+
+    macOS refuses to open top-level Generic Desktop mouse/keyboard
+    collections (see README.md platform notes) — this may simply fail to
+    find anything there; that is an OS restriction, not a bug here.
+    """
+    cands = enumerate_candidates(verbose=False)
+    d = pick_generic_candidate(cands)
+    if d is not None:
         dev = hid.device()
         try:
             dev.open_path(d["path"])
+            dev.set_nonblocking(1)
+            return dev, d
         except Exception as e:
             if verbose:
                 print("  cannot open iface=%s: %s" % (d.get("interface_number"), e))
-            continue
-        dev.set_nonblocking(1)
-        return dev, d
     return None, None
 
 
@@ -651,6 +865,55 @@ def cmd_battery(args):
     return 0
 
 
+def cmd_details(args):
+    cands = enumerate_candidates(verbose=False)
+    if not cands:
+        print("No 0x248A device found.")
+        return 1
+    order = order_candidates(cands)
+
+    for d in order:
+        kk = probe(d, DEFAULT_REPORT_IDS, DEFAULT_LENGTHS, verbose=False)
+        if not kk:
+            continue
+        pid = d.get("product_id", 0)
+        print("Connection: %s (product string: %r)"
+              % (connection_type(pid), (d.get("product_string") or "").strip()))
+        print("PID: 0x%04X   Interface: %s   Path: %s"
+              % (pid, d.get("interface_number"), d["path"].decode(errors="replace")))
+
+        # Same-interface collision as the GUI handles (kimura_gui.py
+        # refresh_device()): on some units the vendor and generic mouse
+        # channels are the SAME candidate, and opening it twice fails —
+        # reuse the already-open handle instead.
+        generic_d = pick_generic_candidate(cands)
+        if generic_d is not None and generic_d["path"] == d["path"]:
+            pct = read_battery(kk.dev)
+            wdev = None
+        else:
+            wdev, _ = open_generic_mouse_collection(verbose=False)
+            pct = read_battery(wdev) if wdev else None
+        if wdev:
+            wdev.close()
+        print("Battery: ~%d%% (unconfirmed)" % pct if pct is not None else "Battery: unavailable")
+
+        details = kk.device_details()
+        dpi = details["dpi_stage"]
+        print("DPI stage: %s" % (dpi if dpi is not None else "unknown"))
+
+        print("\nRaw read-all-blocks (diagnostic — several opcodes still unconfirmed,")
+        print("see PROTOCOL.md §5):")
+        for op, rx in details["blocks"].items():
+            if isinstance(rx, tuple):
+                print("  0x%02X  %s: %s" % (op, rx[0], rx[1]))
+            else:
+                print("  0x%02X  %s" % (op, " ".join("%02X" % b for b in rx[:8])))
+        kk.dev.close()
+        return 0
+    print("Could not establish transport — run `kimura.py probe` for diagnosis.")
+    return 2
+
+
 def cmd_buttons(args):
     dev, d = open_generic_mouse_collection()
     if not dev:
@@ -695,9 +958,13 @@ def cmd_list(args):
     return 0
 
 
+ISSUE_URL = "https://github.com/GG-241/kimura/issues/new"
+
+
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Found a bug or unexpected behavior? Report it: %s" % ISSUE_URL)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pl = sub.add_parser("list", help="list all 0x248A HID interfaces")
@@ -717,6 +984,10 @@ def main():
                       help="hex byte (e.g. 0x06) or alias: %s" % ", ".join(sorted(LED_ALIASES)))
     pled.add_argument("--allow-write", action="store_true",
                       help="required to actually send the write")
+    pled.add_argument("--persist", action="store_true",
+                      help="commit to flash so it survives replug/power-cycle "
+                           "(also resends the button table, resetting unremapped "
+                           "slots to factory default)")
     pled.set_defaults(func=cmd_led)
 
     pb = sub.add_parser("buttons", help="watch button/scroll Input reports (read-only)")
@@ -724,6 +995,10 @@ def main():
 
     pbat = sub.add_parser("battery", help="read battery level (read-only, UNCONFIRMED)")
     pbat.set_defaults(func=cmd_battery)
+
+    pdet = sub.add_parser("details",
+        help="show connection/DPI/battery + raw diagnostic block dump (read-only)")
+    pdet.set_defaults(func=cmd_details)
 
     prm = sub.add_parser("remap",
         help="EXPERIMENTAL: write the button-remap table (write, gated, unverified on real hardware)")
@@ -742,6 +1017,14 @@ def main():
     prm.add_argument("--yes", action="store_true",
                      help="skip the interactive confirmation prompt")
     prm.set_defaults(func=cmd_remap)
+
+    pfr = sub.add_parser("factory-reset",
+        help="restore button table + LED to factory defaults (write, gated, flash commit)")
+    pfr.add_argument("--allow-write", action="store_true",
+                     help="required to actually send the write")
+    pfr.add_argument("--yes", action="store_true",
+                     help="skip the interactive RESTORE confirmation prompt")
+    pfr.set_defaults(func=cmd_factory_reset)
 
     args = p.parse_args()
     return args.func(args)

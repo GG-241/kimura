@@ -62,7 +62,7 @@ if [ ! -d "$VENV" ]; then
     "$PYTHON" -m venv "$VENV"
 fi
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet pyinstaller hidapi customtkinter Pillow pystray
+"$VENV/bin/pip" install --quiet pyinstaller hidapi customtkinter Pillow pystray pyusb
 # pystray's macOS tray backend needs PyObjC, which isn't always present on a
 # fresh Homebrew Python — install it explicitly. If this fails or the tray
 # icon doesn't show up at runtime, the app still runs fine without it
@@ -89,6 +89,7 @@ rm -rf build dist "Kimura GUI.spec"
     --collect-all hidapi \
     --collect-all customtkinter \
     --collect-all pystray \
+    --collect-all usb \
     --collect-data kimura_assets --hidden-import kimura_assets --hidden-import PIL._tkinter_finder \
     --icon packaging/kimura-gui.icns \
     --osx-bundle-identifier com.kimura-driver.gui \

@@ -21,18 +21,36 @@ import importlib.resources
 import queue
 import sys
 import time
-import tkinter as tk
-import customtkinter as ctk
-from tkinter import messagebox
-from PIL import Image, ImageTk
+import webbrowser
 
-import kimura as k
-import kimura_tray
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except ImportError:
+    sys.exit(
+        "Missing dependency: tkinter.\n"
+        "Install it with:\n"
+        "  Linux (Debian/Ubuntu):  sudo apt install python3-tk\n"
+        "  macOS (Homebrew):       brew install python-tk\n")
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    sys.exit("Missing dependency. Install with:  pip install customtkinter")
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    sys.exit("Missing dependency. Install with:  pip install Pillow")
+
+import kimura as k  # noqa: E402 — checks its own `hid` dependency on import
+import kimura_tray  # noqa: E402 — degrades gracefully if pystray/PIL extras are missing
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
 POLL_MS = 30
+ISSUE_URL = k.ISSUE_URL
 
 
 def load_mouse_image():
@@ -82,6 +100,17 @@ class KimuraGUI(ctk.CTk):
         self.geometry("860x580")
         self.minsize(780, 520)
         self.configure(fg_color=ROOT_BG)
+        try:
+            # Window/taskbar icon — the AppImage/.app bundle icons (set at
+            # build time, see packaging/build_appimage.sh and build_dmg.sh)
+            # cover the launcher/dock entry, but the live Tk window itself
+            # falls back to Tk's default feather icon unless set here too.
+            icon_img = load_mouse_image()
+            if icon_img is not None:
+                self._window_icon = ImageTk.PhotoImage(icon_img.resize((128, 128), Image.LANCZOS))
+                self.iconphoto(True, self._window_icon)
+        except Exception:
+            pass
         try:
             # Slight overall window transparency for a softer, more
             # "ethereal" look. Supported on X11 (compositor required),
@@ -145,6 +174,11 @@ class KimuraGUI(ctk.CTk):
         self.battery_var = ctk.StringVar(value="")
         ctk.CTkLabel(topbar, textvariable=self.battery_var,
                     font=ctk.CTkFont(size=13)).pack(side="left", padx=4)
+        ctk.CTkButton(topbar, text="Report an Issue", width=130, fg_color="transparent",
+                     border_width=1, border_color=("gray70", "gray40"),
+                     text_color=("gray20", "gray80"), hover_color=("#d3d6fb", "#2a2c4d"),
+                     command=lambda: webbrowser.open(ISSUE_URL)).pack(
+            side="right", padx=(0, 8), pady=10)
         ctk.CTkButton(topbar, text="Refresh", width=90, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                      command=self.refresh_device).pack(side="right", padx=16, pady=10)
 
@@ -175,8 +209,81 @@ class KimuraGUI(ctk.CTk):
                 "previously-unread channel, not yet independently cross-checked\n"
                 "against the vendor GUI or an actual charge-level change.")
         ctk.CTkLabel(page, text=note, justify="left", anchor="w", text_color="gray60",
-                    font=ctk.CTkFont(size=11)).pack(anchor="w", padx=24, pady=(0, 20))
+                    font=ctk.CTkFont(size=11)).pack(anchor="w", padx=24, pady=(0, 16))
+
+        ctk.CTkLabel(page, text="Mouse Details", font=ctk.CTkFont(size=14, weight="bold")).pack(
+            anchor="w", padx=24, pady=(0, 6))
+        self.mouse_details_var = ctk.StringVar(value="Click Refresh to read details.")
+        ctk.CTkLabel(page, textvariable=self.mouse_details_var, justify="left", anchor="w",
+                    font=ctk.CTkFont(size=12)).pack(anchor="w", padx=24, pady=(0, 6))
+        self.raw_details_box = ctk.CTkTextbox(page, height=110, font=ctk.CTkFont(size=11, family="monospace"))
+        self.raw_details_box.pack(fill="x", padx=24, pady=(0, 6))
+        self.raw_details_box.insert("1.0", "(raw diagnostic block dump appears here after Refresh)")
+        self.raw_details_box.configure(state="disabled")
+        ctk.CTkLabel(page, text="Raw diagnostic dump — several opcodes above are still "
+                                "unconfirmed (see PROTOCOL.md).", justify="left", anchor="w",
+                    text_color="gray60", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=24, pady=(0, 16))
+
+        ctk.CTkButton(page, text="Factory Reset", fg_color="#b03a3a", hover_color="#8f2e2e",
+                     command=self._factory_reset).pack(anchor="w", padx=24, pady=(0, 22))
         return page
+
+    def _refresh_mouse_details(self):
+        if not self.dev:
+            self.mouse_details_var.set("No device connected.")
+            self._set_raw_details_text("(no device connected)")
+            return
+        try:
+            d = self.dev.info
+            pid = d.get("product_id", 0)
+            summary = (
+                "Connection: %s (product string: %r)\n"
+                "PID: 0x%04X   Interface: %s\n"
+                "Path: %s"
+                % (k.connection_type(pid), (d.get("product_string") or "").strip(),
+                   pid, d.get("interface_number"), d["path"].decode(errors="replace")))
+            details = self.dev.device_details()
+            dpi = details["dpi_stage"]
+            summary += "\nDPI stage: %s" % (dpi if dpi is not None else "unknown")
+            self.mouse_details_var.set(summary)
+
+            lines = []
+            for op, rx in details["blocks"].items():
+                if isinstance(rx, tuple):
+                    lines.append("0x%02X  %s: %s" % (op, rx[0], rx[1]))
+                else:
+                    lines.append("0x%02X  %s" % (op, " ".join("%02X" % b for b in rx[:8])))
+            self._set_raw_details_text("\n".join(lines))
+        except k.KimuraError as e:
+            self.mouse_details_var.set("Could not read device details: %s" % e)
+            self._set_raw_details_text("")
+
+    def _set_raw_details_text(self, text):
+        self.raw_details_box.configure(state="normal")
+        self.raw_details_box.delete("1.0", "end")
+        self.raw_details_box.insert("1.0", text)
+        self.raw_details_box.configure(state="disabled")
+
+    def _factory_reset(self):
+        if not self.dev:
+            messagebox.showerror("No device", "No transport established. Click Refresh.")
+            return
+        if not messagebox.askyesno(
+                "Confirm Factory Reset",
+                "This will flash:\n"
+                "  - button table -> FACTORY (left/right/middle/back/forward click, "
+                "underside = DPI cycle)\n"
+                "  - LED preset   -> Neon\n"
+                "  - one flash commit\n\n"
+                "Any custom button remap will be lost. Continue?"):
+            return
+        try:
+            self.dev.apply_button_table({}, led_preset=k.LED_ALIASES["default"])
+            messagebox.showinfo("Done", "Factory bundle applied.\n\n"
+                                "Physically verify every button and the LED now.")
+        except k.KimuraError as e:
+            messagebox.showerror("Error", str(e))
 
     def refresh_device(self):
         self._close_devices()
@@ -189,10 +296,10 @@ class KimuraGUI(ctk.CTk):
             self._tray_state.connected = False
             self._tray_state.battery_pct = None
             self._tray_state.dpi_stage = None
+            self._refresh_mouse_details()
             return
 
-        vendor = [d for d in cands if k.is_vendor_collection(d)]
-        order = vendor + [d for d in cands if d not in vendor]
+        order = k.order_candidates(cands)
         chosen_d = None
         for d in order:
             kk = k.probe(d, k.DEFAULT_REPORT_IDS, k.DEFAULT_LENGTHS, verbose=False)
@@ -210,7 +317,7 @@ class KimuraGUI(ctk.CTk):
 
         # Same-interface collision as before (2.4GHz receiver): reuse the
         # handle instead of opening the generic mouse collection twice.
-        generic_d = self._pick_generic_candidate(cands)
+        generic_d = k.pick_generic_candidate(cands)
         if generic_d is not None and chosen_d is not None and generic_d["path"] == chosen_d["path"]:
             self.dev.dev.set_nonblocking(1)
             self.watch_dev = self.dev.dev
@@ -228,17 +335,7 @@ class KimuraGUI(ctk.CTk):
             self.battery_var.set("")
             self._tray_state.battery_pct = None
         self._tray_state.connected = self.dev is not None
-
-    @staticmethod
-    def _pick_generic_candidate(cands):
-        """Mirrors open_generic_mouse_collection()'s own selection logic
-        (kimura.py), just without opening anything — used to detect the
-        same-interface collision above."""
-        generic = [d for d in cands
-                  if not k.is_vendor_collection(d) and (d.get("usage_page") or 0) == 0x0001]
-        if not generic:
-            generic = [d for d in cands if d.get("interface_number") == 0]
-        return generic[0] if generic else None
+        self._refresh_mouse_details()
 
     def _close_devices(self):
         shared = self.dev is not None and self.watch_dev is self.dev.dev
@@ -282,11 +379,16 @@ class KimuraGUI(ctk.CTk):
         preset = self._led_name_to_value.get(name)
         if preset is None:
             return
-        if not messagebox.askyesno("Confirm", "Send LED preset %s to the mouse?" % name):
+        if not messagebox.askyesno(
+                "Confirm",
+                "Send LED preset %s to the mouse?\n\n"
+                "This also resends the button-remap table so the change survives "
+                "replug/power-cycle — any button slot not set via Button Remap will "
+                "be (re)set to its factory default." % name):
             return
         try:
-            self.dev.set_led(preset)
-            messagebox.showinfo("Sent", "LED preset sent.")
+            self.dev.set_led(preset, persist=True)
+            messagebox.showinfo("Sent", "LED preset sent and committed to flash.")
         except k.KimuraError as e:
             messagebox.showerror("Error", str(e))
 
