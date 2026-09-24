@@ -232,6 +232,12 @@ too. Useful details to include: your OS, how you installed (AppImage/DMG/
 pip/source), the exact command or button you used, and the full error
 text if there was one.
 
+Both the CLI and GUI also log to `~/.kimura/kimura.log` (rotated, kept
+small) — every write attempt, its result, and any error, including ones
+that only show as a dialog box with no visible Terminal (the AppImage/DMG
+builds have no console window). Attaching the last few lines of that file
+to a bug report is usually more useful than the dialog text alone.
+
 ## License
 
 Free for personal and noncommercial use under the [PolyForm Noncommercial
