@@ -1,7 +1,7 @@
 # Kimura v3.0 (MS-4300WG) — Unofficial Linux & macOS Driver
 
-A community, user-space configuration tool for the **Zeroground Kimura v3.0
-(MS-4300WG)** gaming mouse, for Linux and macOS.
+A community, user-space configuration tool for the [**Zeroground Kimura v3.0
+(MS-4300WG)**](https://www.zero-ground.com/kimura-30-leuko) gaming mouse, for Linux and macOS.
 
 **Why this exists:** Zeroground only ships an official configuration
 utility for Windows. Before starting this project, an attempt was made to
@@ -249,3 +249,14 @@ this repository.
 
 Use at your own risk. The `remap` command in particular is not fully
 verified against real hardware — read its section above before using it.
+
+## Support this project
+
+Kimura is an independent, spare-time project and is offered free of
+charge. If you found it useful and would like to support its continued
+development, you can buy the author a coffee — it is genuinely
+appreciated:
+
+<p align="center">
+  <img src="donate-qr.png" alt="Donation QR code" width="240">
+</p>

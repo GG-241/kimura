@@ -10,7 +10,9 @@ If any output write fails, abort BEFORE 0xFA (nothing flashed).
 import sys
 import time
 
-sys.path.insert(0, "/Users/george/Documents/kimura")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kimura as k  # noqa: E402
 
 
