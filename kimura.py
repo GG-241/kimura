@@ -33,7 +33,7 @@ except ImportError:
 # can tell which build is actually running without a Terminal, since
 # multiple install paths (pip, AppImage, DMG, install.sh's separate
 # ~/Applications wrapper on macOS) can otherwise leave stale copies around.
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 LOG_DIR = os.path.expanduser("~/.kimura")
 LOG_FILE = os.path.join(LOG_DIR, "kimura.log")
@@ -227,6 +227,51 @@ class KimuraError(Exception):
 VENDOR_OUTPUT_INTERFACE = 1  # see _control_plane_output_write()'s docstring
 
 
+def reattach_kernel_driver(vid, pid, interface_number):
+    """Best-effort: reattach the kernel's usbhid driver to `interface_number`
+    on every matching USB device, if it isn't already active there.
+
+    CONFIRMED real-world need (2026-09-24): opening the GENERIC mouse
+    collection (interface 0 — see open_generic_mouse_collection()) via
+    hidapi's Linux/libusb backend detaches the kernel driver from that
+    interface to get raw access, exactly like _control_plane_output_write()
+    does deliberately for interface 1 — except hidapi does this internally
+    and does NOT reattach it when the handle is closed. Since interface 0
+    is what feeds the OS's own cursor-movement pipeline, this silently
+    breaks the mouse as a normal pointing device system-wide until a
+    physical replug, for as long as it stays detached — reproduced live:
+    running `kimura buttons` (or the GUI opening the Live tab / reading
+    battery, which use the same collection) was enough to break real-
+    hardware cursor movement, confirmed via `/proc/bus/input/devices`
+    losing its Mouse entry for that interface and fixed by calling this
+    exact reattach, no replug needed.
+
+    Linux-only (macOS's IOHIDFamily doesn't have an equivalent kernel-
+    driver-detach step exposed the same way — a parallel "mouse stopped
+    responding until unplug/replug" symptom has been reported there too,
+    but the underlying mechanism isn't confirmed; this function can't help
+    there). Never raises — logs a warning on failure instead, so a failed
+    reattach is at least visible (previously silently swallowed here and
+    in _control_plane_output_write(), which is how this went unnoticed).
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        import usb.core
+    except ImportError:
+        log.warning("reattach_kernel_driver: pyusb not available, cannot reattach "
+                   "interface %d — device may need a physical replug", interface_number)
+        return
+    for dev in usb.core.find(idVendor=vid, idProduct=pid, find_all=True):
+        try:
+            if not dev.is_kernel_driver_active(interface_number):
+                dev.attach_kernel_driver(interface_number)
+                log.info("reattached kernel driver to interface %d", interface_number)
+        except Exception as e:
+            log.warning("reattach_kernel_driver: failed for interface %d: %s "
+                       "— device may need a physical replug", interface_number, e)
+
+
 def _control_plane_output_write(vid, pid, buf):
     """Send `buf` (report_id + 32 payload bytes) as a HID class SET_REPORT
     control transfer (bmRequestType 0x21, bRequest 0x09, wValue 0x02<<8 |
@@ -283,8 +328,10 @@ def _control_plane_output_write(vid, pid, buf):
             if detached:
                 try:
                     dev.attach_kernel_driver(VENDOR_OUTPUT_INTERFACE)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("control-plane write: failed to reattach kernel driver "
+                               "to interface %d: %s — device may need a physical replug",
+                               VENDOR_OUTPUT_INTERFACE, e)
     log.error("control-plane output write failed on every candidate device: %s",
              "; ".join(errors))
     raise KimuraError("control-plane fallback failed on every candidate device: %s"
@@ -299,6 +346,17 @@ class Kimura:
         self.report_id = report_id
         self.feature_len = feature_len
         self.info = info
+
+    def close(self):
+        """Close the underlying handle and reattach its kernel driver.
+
+        Always use this over bare `self.dev.close()` — see
+        reattach_kernel_driver()'s docstring for why leaving that out is a
+        confirmed way to break the mouse as a normal pointing device.
+        """
+        self.dev.close()
+        reattach_kernel_driver(VID, self.info.get("product_id", 0),
+                               self.info.get("interface_number"))
 
     # -- low level ----------------------------------------------------------
     def _tx(self, opcode, payload=b""):
@@ -370,7 +428,22 @@ class Kimura:
                 "Platform notes). This is an OS limitation, not a bug here; "
                 "retrying will not help.")
 
-        _control_plane_output_write(VID, self.info.get("product_id", 0), buf)
+        # If this object's own Feature-command session is ALSO on the
+        # vendor output interface, its open hidapi handle exclusively
+        # claims that interface via libusb — colliding with the pyusb
+        # claim _control_plane_output_write() needs (CONFIRMED, real
+        # hardware, 2026-09-24: EBUSY). Release it first, then reopen
+        # once the control-plane write is done, so later commands in the
+        # same bundle (apply_button_table() sends several after this)
+        # keep working.
+        release_and_reopen = self.info.get("interface_number") == VENDOR_OUTPUT_INTERFACE
+        if release_and_reopen:
+            self.dev.close()  # NOT self.close() — don't reattach, pyusb needs it right after
+        try:
+            _control_plane_output_write(VID, self.info.get("product_id", 0), buf)
+        finally:
+            if release_and_reopen:
+                self.dev.open_path(self.info["path"])
 
     def command(self, opcode, payload=b"", expect_reply=True):
         """Write a command; optionally read back and verify the opcode echo."""
@@ -567,27 +640,33 @@ def is_vendor_collection(d):
 
 
 def order_candidates(cands):
-    """Order HID interface candidates, vendor-defined usage pages first.
+    """Order HID interface candidates: vendor-defined usage pages first,
+    then interface_number == 1 as a tie-break, then everything else.
 
-    Deliberately does NOT prefer interface_number == 1 (the real vendor/
-    page-data channel on the hardware characterized in PROTOCOL.md and
-    confirmed again via a 2026-09-22 usbmon capture) for the FEATURE-
-    command session: on real hardware this firmware answers Feature
-    SET_REPORT/GET_REPORT (ping, LED, page-select) identically regardless
-    of which interface's control endpoint receives the request, so
-    whichever interface answers first (often interface 0, when usage_page
-    is unreliable — see open_generic_mouse_collection()'s docstring for
-    the same Linux hidapi quirk) works fine for Feature commands. Output-
-    report (page-data) writes are handled entirely separately in
-    _tx_output()/_control_plane_output_write(), which always target
-    interface 1 explicitly via a dedicated pyusb/libusb claim — keeping
-    that claim off whatever interface this function's caller opens for
-    Feature commands avoids the two colliding (CONFIRMED: they do collide,
-    real hardware, 2026-09-22 — pyusb got EBUSY when the Feature session
-    was also forced onto interface 1).
+    The interface-1 preference exists to keep the Feature-command session
+    OFF interface 0 whenever possible — CONFIRMED real hardware, 2026-09-24:
+    simply having a hidapi handle open on interface 0 (the mouse's actual
+    Boot Mouse/cursor-movement interface), even with no reads at all,
+    detaches it from the kernel's own usbhid driver for as long as the
+    handle stays open, breaking the system mouse cursor for the whole
+    session. This firmware answers Feature SET_REPORT/GET_REPORT (ping,
+    LED, page-select) identically regardless of which interface's control
+    endpoint receives the request, so preferring interface 1 costs
+    nothing functionally and avoids that risk in the common case where
+    usage_page doesn't already disambiguate (often 0x0000 for every
+    candidate — see open_generic_mouse_collection()'s docstring for the
+    same Linux hidapi quirk).
+
+    This does mean the Feature session can end up on the SAME interface
+    _tx_output()/_control_plane_output_write() needs exclusively for its
+    pyusb-based page-data writes (VENDOR_OUTPUT_INTERFACE, also 1) —
+    _tx_output() handles that collision itself by releasing and
+    reacquiring this object's own hidapi handle around the pyusb call.
     """
     vendor = [d for d in cands if is_vendor_collection(d)]
-    return vendor + [d for d in cands if d not in vendor]
+    iface1 = [d for d in cands if d not in vendor and d.get("interface_number") == 1]
+    rest = [d for d in cands if d not in vendor and d not in iface1]
+    return vendor + iface1 + rest
 
 
 def probe(d, report_ids, lengths, verbose=True):
@@ -655,7 +734,7 @@ def cmd_probe(args):
                     else:
                         print("  0x%02X  %s" % (
                             op, " ".join("%02X" % b for b in rx[:24])))
-            k.dev.close()
+            k.close()
             return 0
     print("\nNo working (report_id, length) combination found.")
     print("Next step: capture the report descriptor and read the real feature "
@@ -710,14 +789,14 @@ def cmd_led(args):
                 k.set_led(preset, persist=args.persist)
             except KimuraError as e:
                 print("Error: %s" % e)
-                k.dev.close()
+                k.close()
                 return 3
             print("Sent LED preset 0x%02X (%s)%s."
                   % (preset, LED_PRESETS[preset], " and committed to flash" if args.persist else ""))
             if not args.persist:
                 print("This is a live preview only — it will revert on replug/power-cycle.")
                 print("Pass --persist to make it stick.")
-            k.dev.close()
+            k.close()
             return 0
     print("Could not establish transport — run `kimura.py probe` for diagnosis.")
     return 2
@@ -752,10 +831,10 @@ def cmd_factory_reset(args):
                 k.apply_button_table({}, led_preset=LED_ALIASES["default"])
             except KimuraError as e:
                 print("Error: %s" % e)
-                k.dev.close()
+                k.close()
                 return 3
             print("Factory bundle applied. Physically verify every button and the LED now.")
-            k.dev.close()
+            k.close()
             return 0
     print("Could not establish transport — run `kimura.py probe` for diagnosis.")
     return 2
@@ -828,7 +907,7 @@ def cmd_remap(args):
             k.apply_button_table(overrides, led_preset=led)
             print("\nSent. Physically test every remapped button now — this")
             print("write path has no independent verification beyond this.")
-            k.dev.close()
+            k.close()
             return 0
     print("Could not establish transport — run `kimura.py probe` for diagnosis.")
     return 2
@@ -930,6 +1009,7 @@ def cmd_battery(args):
         return 1
     pct = read_battery(dev)
     dev.close()
+    reattach_kernel_driver(VID, d.get("product_id", 0), d.get("interface_number"))
     if pct is None:
         print("Could not read the battery channel.")
         return 1
@@ -961,12 +1041,13 @@ def cmd_details(args):
         generic_d = pick_generic_candidate(cands)
         if generic_d is not None and generic_d["path"] == d["path"]:
             pct = read_battery(kk.dev)
-            wdev = None
+            wdev, wd = None, None
         else:
-            wdev, _ = open_generic_mouse_collection(verbose=False)
+            wdev, wd = open_generic_mouse_collection(verbose=False)
             pct = read_battery(wdev) if wdev else None
         if wdev:
             wdev.close()
+            reattach_kernel_driver(VID, wd.get("product_id", 0), wd.get("interface_number"))
         print("Battery: ~%d%% (unconfirmed)" % pct if pct is not None else "Battery: unavailable")
 
         details = kk.device_details()
@@ -980,7 +1061,7 @@ def cmd_details(args):
                 print("  0x%02X  %s: %s" % (op, rx[0], rx[1]))
             else:
                 print("  0x%02X  %s" % (op, " ".join("%02X" % b for b in rx[:8])))
-        kk.dev.close()
+        kk.close()
         return 0
     print("Could not establish transport — run `kimura.py probe` for diagnosis.")
     return 2
@@ -1003,6 +1084,15 @@ def cmd_buttons(args):
 
     print("Watching button/scroll Input reports (report_id=1, read-only).")
     print("Press Ctrl+C to stop.\n")
+    # CONFIRMED real-world need (2026-09-24): a SIGTERM (e.g. from `timeout`,
+    # or a process manager) skips the finally block below entirely by
+    # default, leaving the kernel driver detached from this interface —
+    # exactly what broke real-hardware cursor movement system-wide until a
+    # replug. Convert it into the same KeyboardInterrupt cleanup path.
+    import signal as _signal
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+    old_handler = _signal.signal(_signal.SIGTERM, _on_sigterm)
     try:
         while True:
             try:
@@ -1021,7 +1111,9 @@ def cmd_buttons(args):
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        _signal.signal(_signal.SIGTERM, old_handler)
         dev.close()
+        reattach_kernel_driver(VID, d.get("product_id", 0), d.get("interface_number"))
     return 0
 
 

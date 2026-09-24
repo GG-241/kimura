@@ -208,6 +208,35 @@ the one above (`uaccess` already covers `/dev/bus/usb/*`), and this
 doesn't disturb the Feature-command session, which normally lives on a
 different interface.
 
+**Mouse stops working system-wide while the app is running/after a crash
+(Linux, fixed 2026-09-24).** Any hidapi handle opened on interface 0 —
+the mouse's actual cursor-movement interface — detaches it from the
+kernel's own `usbhid` driver, on Linux, for as long as the handle stays
+open; hidapi does not reattach it on close. This was previously a real,
+reproduced-live bug: opening `kimura`/`kimura-gui` at all could leave the
+system mouse cursor unresponsive until a physical replug, worse if the
+process was killed (SIGTERM) rather than closed normally, since cleanup
+never ran. Now fixed several ways: the Feature-command session prefers
+interface 1 over interface 0 whenever possible (costs nothing — this
+firmware answers Feature commands identically regardless of interface);
+the Live tab's button/movement view and the battery reading only hold
+interface 0 open for as long as they're actually needed (not the app's
+whole lifetime); every code path that does open a handle explicitly
+reattaches the kernel driver on close, including on SIGTERM. If you ever
+do see the mouse stop responding as a normal pointing device, a udev
+device reset without unplugging works too — see `reattach_kernel_driver()`
+in `kimura.py` for the exact mechanism, or as a first resort just unplug
+and replug the receiver.
+
+A parallel symptom was also reported on **macOS** (mouse unresponsive
+after the app opened, fixed by unplugging/replugging the receiver) — the
+underlying mechanism there is NOT confirmed (macOS's IOHIDFamily doesn't
+expose an equivalent "kernel driver detach" the same way), so the Linux
+fixes above can't be verified to fully cover it. If you hit this on
+macOS, the same interface-0-avoidance and lazy-Live-tab-opening changes
+should reduce exposure, but treat it as unconfirmed until tested on real
+macOS hardware.
+
 ## Dependencies
 
 Both `kimura` (CLI) and `kimura-gui` check their dependencies on startup and

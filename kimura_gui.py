@@ -20,6 +20,7 @@ Run with:  kimura-gui        (installed via pip, see pyproject.toml)
 import importlib.resources
 import queue
 import sys
+import threading
 import time
 import traceback
 import webbrowser
@@ -122,9 +123,12 @@ class KimuraGUI(ctk.CTk):
 
         self.dev = None        # Kimura instance (vendor channel), for writes
         self.watch_dev = None  # raw hid.device (generic mouse channel), read-only
+        self._watch_dev_info = None  # enumerate_candidates() dict for watch_dev, for reattach on close
+        self._current_page = None
         self.button_labels = {}
         self.pages = {}
         self.nav_buttons = {}
+        self._busy_buttons = []  # disabled together during any async device op
         self._closed = False
 
         self._build_layout()
@@ -183,8 +187,9 @@ class KimuraGUI(ctk.CTk):
                      text_color=("gray20", "gray80"), hover_color=("#d3d6fb", "#2a2c4d"),
                      command=lambda: webbrowser.open(ISSUE_URL)).pack(
             side="right", padx=(0, 8), pady=10)
-        ctk.CTkButton(topbar, text="Refresh", width=90, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                     command=self.refresh_device).pack(side="right", padx=16, pady=10)
+        self._refresh_btn = ctk.CTkButton(topbar, text="Refresh", width=90, fg_color=ACCENT,
+                                          hover_color=ACCENT_HOVER, command=self.refresh_device)
+        self._refresh_btn.pack(side="right", padx=16, pady=10)
 
         content = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         content.grid(row=1, column=1, sticky="nswe", padx=18, pady=18)
@@ -200,6 +205,13 @@ class KimuraGUI(ctk.CTk):
             (page.pack(fill="both", expand=True) if n == name else page.pack_forget())
         for n, btn in self.nav_buttons.items():
             btn.configure(fg_color=("#d3d6fb", "#2a2c4d") if n == name else "transparent")
+        self._current_page = name
+        # Only hold the generic mouse collection open while the Live page
+        # is actually visible — see _open_watch_dev()'s docstring for why.
+        if name == "Live":
+            self._open_watch_dev()
+        else:
+            self._close_watch_dev()
 
     # -- device / battery ---------------------------------------------------
     def _build_device_page(self, parent):
@@ -229,8 +241,10 @@ class KimuraGUI(ctk.CTk):
                     text_color="gray60", font=ctk.CTkFont(size=11)).pack(
             anchor="w", padx=24, pady=(0, 16))
 
-        ctk.CTkButton(page, text="Factory Reset", fg_color="#b03a3a", hover_color="#8f2e2e",
-                     command=self._factory_reset).pack(anchor="w", padx=24, pady=(0, 22))
+        btn = ctk.CTkButton(page, text="Factory Reset", fg_color="#b03a3a", hover_color="#8f2e2e",
+                           command=self._factory_reset)
+        btn.pack(anchor="w", padx=24, pady=(0, 22))
+        self._busy_buttons.append(btn)
         return page
 
     def _refresh_mouse_details(self):
@@ -238,20 +252,36 @@ class KimuraGUI(ctk.CTk):
             self.mouse_details_var.set("No device connected.")
             self._set_raw_details_text("(no device connected)")
             return
-        try:
-            d = self.dev.info
-            pid = d.get("product_id", 0)
-            summary = (
-                "Connection: %s (product string: %r)\n"
-                "PID: 0x%04X   Interface: %s\n"
-                "Path: %s"
-                % (k.connection_type(pid), (d.get("product_string") or "").strip(),
-                   pid, d.get("interface_number"), d["path"].decode(errors="replace")))
-            details = self.dev.device_details()
-            dpi = details["dpi_stage"]
-            summary += "\nDPI stage: %s" % (dpi if dpi is not None else "unknown")
-            self.mouse_details_var.set(summary)
+        d = self.dev.info
+        pid = d.get("product_id", 0)
+        summary = (
+            "Connection: %s (product string: %r)\n"
+            "PID: 0x%04X   Interface: %s\n"
+            "Path: %s"
+            % (k.connection_type(pid), (d.get("product_string") or "").strip(),
+               pid, d.get("interface_number"), d["path"].decode(errors="replace")))
+        self.mouse_details_var.set(summary + "\nDPI stage: reading...")
+        self._set_raw_details_text("(reading...)")
+        self._refresh_btn.configure(state="disabled")
 
+        # device_details() does 5 Feature-report round trips — async so a
+        # slow/hung read (see _run_async()'s docstring) doesn't freeze the
+        # whole window on every Refresh click.
+        dev = self.dev
+
+        def worker():
+            return dev.device_details()
+
+        def done(details, error):
+            self._refresh_btn.configure(state="normal")
+            if error:
+                k.log.error("Mouse Details refresh failed: %s", error)
+                self.mouse_details_var.set("Could not read device details: %s" % error)
+                self._set_raw_details_text("")
+                return
+            dpi = details["dpi_stage"]
+            self.mouse_details_var.set(
+                summary + "\nDPI stage: %s" % (dpi if dpi is not None else "unknown"))
             lines = []
             for op, rx in details["blocks"].items():
                 if isinstance(rx, tuple):
@@ -259,10 +289,8 @@ class KimuraGUI(ctk.CTk):
                 else:
                     lines.append("0x%02X  %s" % (op, " ".join("%02X" % b for b in rx[:8])))
             self._set_raw_details_text("\n".join(lines))
-        except k.KimuraError as e:
-            k.log.error("Mouse Details refresh failed: %s", e)
-            self.mouse_details_var.set("Could not read device details: %s" % e)
-            self._set_raw_details_text("")
+
+        self._run_async(worker, done)
 
     def _set_raw_details_text(self, text):
         self.raw_details_box.configure(state="normal")
@@ -283,13 +311,22 @@ class KimuraGUI(ctk.CTk):
                 "  - one flash commit\n\n"
                 "Any custom button remap will be lost. Continue?"):
             return
-        try:
-            self.dev.apply_button_table({}, led_preset=k.LED_ALIASES["default"])
-            messagebox.showinfo("Done", "Factory bundle applied.\n\n"
-                                "Physically verify every button and the LED now.")
-        except k.KimuraError as e:
-            k.log.error("Factory Reset failed: %s", e)
-            messagebox.showerror("Error", str(e))
+        dev = self.dev
+        self._set_busy(True, "Applying factory reset...")
+
+        def worker():
+            dev.apply_button_table({}, led_preset=k.LED_ALIASES["default"])
+
+        def done(result, error):
+            self._set_busy(False)
+            if error:
+                k.log.error("Factory Reset failed: %s", error)
+                messagebox.showerror("Error", str(error))
+            else:
+                messagebox.showinfo("Done", "Factory bundle applied.\n\n"
+                                    "Physically verify every button and the LED now.")
+
+        self._run_async(worker, done)
 
     def refresh_device(self):
         self._close_devices()
@@ -321,21 +358,20 @@ class KimuraGUI(ctk.CTk):
         else:
             self.status_var.set("Found a 0x248A device but couldn't establish transport")
 
-        # Same-interface collision as before (2.4GHz receiver): reuse the
-        # handle instead of opening the generic mouse collection twice.
+        # Battery: a short-lived open+read+close, NOT held open continuously
+        # — see _open_watch_dev()'s docstring for why holding this interface
+        # open breaks the mouse as a normal pointing device.
         generic_d = k.pick_generic_candidate(cands)
         if generic_d is not None and chosen_d is not None and generic_d["path"] == chosen_d["path"]:
-            self.dev.dev.set_nonblocking(1)
-            self.watch_dev = self.dev.dev
+            pct = k.read_battery(self.dev.dev)  # Feature-report read, no interrupt claim needed
         else:
-            wdev, _ = k.open_generic_mouse_collection(verbose=False)
+            wdev, wd = k.open_generic_mouse_collection(verbose=False)
+            pct = k.read_battery(wdev) if wdev else None
             if wdev:
-                wdev.set_nonblocking(1)
-            self.watch_dev = wdev
-
-        if self.watch_dev:
-            pct = k.read_battery(self.watch_dev)
-            self.battery_var.set("· Battery: ~%d%% (unconfirmed)" % pct if pct is not None else "")
+                wdev.close()
+                k.reattach_kernel_driver(k.VID, wd.get("product_id", 0), wd.get("interface_number"))
+        if pct is not None:
+            self.battery_var.set("· Battery: ~%d%% (unconfirmed)" % pct)
             self._tray_state.battery_pct = pct
         else:
             self.battery_var.set("")
@@ -343,20 +379,120 @@ class KimuraGUI(ctk.CTk):
         self._tray_state.connected = self.dev is not None
         self._refresh_mouse_details()
 
-    def _close_devices(self):
+        # Re-open the Live-tab watch handle if that's the page showing —
+        # refresh_device() (via _close_devices() above) just closed it.
+        if self._current_page == "Live":
+            self._open_watch_dev()
+
+    def _open_watch_dev(self):
+        """Open the generic mouse collection for the Live tab's live
+        button/movement display. ONLY called while that page is actually
+        visible (see _show_page()) — see the big warning in
+        _close_watch_dev() for why this can't be held open all the time.
+        """
+        if self.watch_dev or not self.dev:
+            return
+        cands = k.enumerate_candidates(verbose=False)
+        generic_d = k.pick_generic_candidate(cands)
+        if generic_d is not None and generic_d["path"] == self.dev.info["path"]:
+            self.dev.dev.set_nonblocking(1)
+            self.watch_dev = self.dev.dev
+            self._watch_dev_info = None  # shared with self.dev — its own cleanup covers it
+        else:
+            wdev, wd = k.open_generic_mouse_collection(verbose=False)
+            if wdev:
+                wdev.set_nonblocking(1)
+            self.watch_dev = wdev
+            self._watch_dev_info = wd
+
+    def _close_watch_dev(self):
+        """Close the Live tab's watch handle and reattach its kernel
+        driver.
+
+        CONFIRMED real-world need (2026-09-24): opening the generic mouse
+        collection (interface 0 — see open_generic_mouse_collection()'s
+        docstring) and reading raw Input reports from it (what the Live
+        tab does) requires hidapi to exclusively claim that interface via
+        libusb on Linux, detaching it from the kernel's OWN mouse driver
+        for as long as the handle stays open — NOT just on a crash. This
+        was reproduced live: simply having the app running with this
+        handle open (independent of any error) made the interface show as
+        claimed by `usbfs` instead of `usbhid`, breaking the system mouse
+        cursor for the whole session, on both Linux (confirmed) and
+        (reported, mechanism unconfirmed) macOS. The mitigation is to only
+        hold this handle open while the Live page is actually visible —
+        see _show_page() — not for the app's whole lifetime.
+        """
+        if not self.watch_dev:
+            return
         shared = self.dev is not None and self.watch_dev is self.dev.dev
-        if self.dev:
-            try:
-                self.dev.dev.close()
-            except Exception:
-                pass
-            self.dev = None
-        if self.watch_dev and not shared:
+        if not shared:
             try:
                 self.watch_dev.close()
             except Exception:
                 pass
+            if self._watch_dev_info:
+                k.reattach_kernel_driver(k.VID, self._watch_dev_info.get("product_id", 0),
+                                         self._watch_dev_info.get("interface_number"))
         self.watch_dev = None
+        self._watch_dev_info = None
+
+    def _close_devices(self):
+        self._close_watch_dev()
+        if self.dev:
+            try:
+                self.dev.close()  # Kimura.close() — closes + reattaches the kernel driver
+            except Exception:
+                pass
+            self.dev = None
+
+    # -- async device I/O ---------------------------------------------------
+    def _run_async(self, worker, on_done):
+        """Run a blocking Kimura call on a background thread so the GUI
+        stays responsive no matter what the device does.
+
+        CONFIRMED real risk this addresses (2026-09-24): hidapi's
+        get_feature_report() can raise OSError on macOS mid-operation —
+        kimura.py's _tx()/_rx() now normalize that into a catchable
+        KimuraError, but there's no cross-platform guarantee a hung
+        (rather than erroring) HID call always returns in bounded time.
+        Since all device I/O previously ran directly in a button's Tk
+        callback, a genuine hang would freeze the whole window (unmovable,
+        unclosable) for as long as the underlying call blocks. Running it
+        here instead keeps the Tk main loop pumping regardless.
+
+        `worker()` takes no args and returns a result (or raises).
+        `on_done(result, error)` is called back on the MAIN thread via
+        `after()` once the worker finishes — exactly one of result/error
+        is not None. Buttons that trigger this should disable themselves
+        first and re-enable in `on_done`, since Kimura isn't safe for
+        concurrent calls from multiple threads.
+        """
+        def run():
+            try:
+                result = worker()
+            except Exception as e:
+                self.after(0, lambda: on_done(None, e))
+            else:
+                self.after(0, lambda: on_done(result, None))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_busy(self, busy, status_text=None):
+        """Disable/enable the write-action buttons during an async op, and
+        optionally show a status message (restored automatically when
+        busy=False). Prevents concurrent device access from two buttons at
+        once (Kimura isn't thread-safe for that) and gives visible
+        feedback that something is happening instead of the button just
+        looking unresponsive."""
+        state = "disabled" if busy else "normal"
+        for btn in self._busy_buttons:
+            btn.configure(state=state)
+        if busy:
+            self._status_before_busy = self.status_var.get()
+            if status_text is not None:
+                self.status_var.set(status_text)
+        else:
+            self.status_var.set(getattr(self, "_status_before_busy", self.status_var.get()))
 
     # -- LED page ----------------------------------------------------------
     def _build_led_page(self, parent):
@@ -372,9 +508,10 @@ class KimuraGUI(ctk.CTk):
         self.led_var = ctk.StringVar(value=names[0] if names else "")
         ctk.CTkComboBox(row, variable=self.led_var, values=names, width=280,
                         state="readonly").pack(side="left")
-        ctk.CTkButton(row, text="Apply", width=90, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                     command=self._apply_led).pack(
-            side="left", padx=(12, 0))
+        btn = ctk.CTkButton(row, text="Apply", width=90, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                           command=self._apply_led)
+        btn.pack(side="left", padx=(12, 0))
+        self._busy_buttons.append(btn)
         return page
 
     def _apply_led(self):
@@ -392,12 +529,21 @@ class KimuraGUI(ctk.CTk):
                 "replug/power-cycle — any button slot not set via Button Remap will "
                 "be (re)set to its factory default." % name):
             return
-        try:
-            self.dev.set_led(preset, persist=True)
-            messagebox.showinfo("Sent", "LED preset sent and committed to flash.")
-        except k.KimuraError as e:
-            k.log.error("LED Apply failed: %s", e)
-            messagebox.showerror("Error", str(e))
+        dev = self.dev
+        self._set_busy(True, "Sending LED preset...")
+
+        def worker():
+            dev.set_led(preset, persist=True)
+
+        def done(result, error):
+            self._set_busy(False)
+            if error:
+                k.log.error("LED Apply failed: %s", error)
+                messagebox.showerror("Error", str(error))
+            else:
+                messagebox.showinfo("Sent", "LED preset sent and committed to flash.")
+
+        self._run_async(worker, done)
 
     # -- Remap page (EXPERIMENTAL) ------------------------------------------
     def _build_remap_page(self, parent):
@@ -435,9 +581,10 @@ class KimuraGUI(ctk.CTk):
                             state="readonly").grid(row=i, column=1, pady=4, padx=(8, 0))
             self.remap_vars[slot] = var
 
-        ctk.CTkButton(page, text="Apply Remap", fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                     command=self._apply_remap).pack(
-            anchor="w", padx=24, pady=(0, 20))
+        btn = ctk.CTkButton(page, text="Apply Remap", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                           command=self._apply_remap)
+        btn.pack(anchor="w", padx=24, pady=(0, 20))
+        self._busy_buttons.append(btn)
         return page
 
     def _canvas_bg(self):
@@ -483,14 +630,23 @@ class KimuraGUI(ctk.CTk):
                 "About to write:\n%s\n\nAll other slots reset to factory default.\n"
                 "This write path is unverified on real hardware. Continue?" % summary):
             return
-        try:
-            self.dev.apply_button_table(overrides)
-            messagebox.showinfo("Sent", "Button table sent.\n\n"
-                                "Physically test every remapped button now — this write "
-                                "path has no independent verification beyond that.")
-        except k.KimuraError as e:
-            k.log.error("Button Remap Apply failed: %s", e)
-            messagebox.showerror("Error", str(e))
+        dev = self.dev
+        self._set_busy(True, "Sending button table...")
+
+        def worker():
+            dev.apply_button_table(overrides)
+
+        def done(result, error):
+            self._set_busy(False)
+            if error:
+                k.log.error("Button Remap Apply failed: %s", error)
+                messagebox.showerror("Error", str(error))
+            else:
+                messagebox.showinfo("Sent", "Button table sent.\n\n"
+                                    "Physically test every remapped button now — this write "
+                                    "path has no independent verification beyond that.")
+
+        self._run_async(worker, done)
 
     # -- Live page (read-only) ------------------------------------------
     def _build_live_page(self, parent):
@@ -604,6 +760,13 @@ class KimuraGUI(ctk.CTk):
 def main():
     print("kimura-gui %s" % k.__version__, file=sys.stderr)
     app = KimuraGUI()
+    # A SIGTERM (process manager, `timeout`, force-quit) bypasses
+    # WM_DELETE_WINDOW/_on_close() entirely by default, skipping device
+    # cleanup — see _close_watch_dev()'s docstring for why that matters
+    # (leaves a kernel driver detached). Route it through the same
+    # graceful shutdown path instead.
+    import signal
+    signal.signal(signal.SIGTERM, lambda signum, frame: app._on_close())
     app.mainloop()
 
 
