@@ -293,5 +293,9 @@ development, you can buy the author a coffee — it is genuinely
 appreciated:
 
 <p align="center">
-  <img src="donate-qr.png" alt="Donation QR code" width="240">
+  <a href="https://buymeacoffee.com/imgg">
+    <img src="donate-qr.png" alt="Donation QR code — buymeacoffee.com/imgg" width="240">
+  </a>
+  <br>
+  <a href="https://buymeacoffee.com/imgg">buymeacoffee.com/imgg</a>
 </p>
