@@ -15,14 +15,59 @@ Linux:     needs a udev rule or root for hidraw access — see README.
 """
 
 import argparse
+import logging
+import os
+import platform
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 
 try:
     import hid
 except ImportError:
     sys.exit("Missing dependency. Install with:  pip install hidapi\n"
              "On macOS you may also need:        brew install hidapi")
+
+# Keep in sync with pyproject.toml's [project] version. Printed on startup
+# and shown in the GUI sidebar — exists so a user (or us, debugging a report)
+# can tell which build is actually running without a Terminal, since
+# multiple install paths (pip, AppImage, DMG, install.sh's separate
+# ~/Applications wrapper on macOS) can otherwise leave stale copies around.
+__version__ = "1.1.0"
+
+LOG_DIR = os.path.expanduser("~/.kimura")
+LOG_FILE = os.path.join(LOG_DIR, "kimura.log")
+
+
+def _setup_logging():
+    """Log to ~/.kimura/kimura.log (rotating, 5 x 512KB), in addition to
+    whatever a caller does with an exception (message box, print, etc).
+
+    CONFIRMED NEED (2026-09-24): a real macOS bug report was hard to pin
+    down without the exact error text, and the GUI's --windowed/frozen
+    builds have no visible console at all unless a user happens to know to
+    launch the .app's binary directly from a Terminal — most won't. This
+    file is the one place error details always land, regardless of how
+    the app was started. Logging setup failures are swallowed (a logging
+    problem should never block the app) — falls back to a do-nothing
+    logger in that case, callers don't need to check.
+    """
+    logger = logging.getLogger("kimura")
+    logger.setLevel(logging.INFO)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=5)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(handler)
+        logger.info("--- kimura %s starting (platform=%s, python=%s) ---",
+                    __version__, platform.platform(), platform.python_version())
+    except Exception:
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+
+log = _setup_logging()
 
 VID = 0x248A
 PIDS = (0x5B49, 0x5B4A)
@@ -228,6 +273,8 @@ def _control_plane_output_write(vid, pid, buf):
             n = dev.ctrl_transfer(
                 0x21, 0x09, (0x02 << 8) | report_id, VENDOR_OUTPUT_INTERFACE, buf)
             if n == len(buf):
+                log.info("control-plane output write OK (%d bytes, report_id=0x%02X)",
+                         n, report_id)
                 return
             errors.append("ctrl_transfer wrote %d of %d bytes" % (n, len(buf)))
         except Exception as e:
@@ -238,6 +285,8 @@ def _control_plane_output_write(vid, pid, buf):
                     dev.attach_kernel_driver(VENDOR_OUTPUT_INTERFACE)
                 except Exception:
                     pass
+    log.error("control-plane output write failed on every candidate device: %s",
+             "; ".join(errors))
     raise KimuraError("control-plane fallback failed on every candidate device: %s"
                       % "; ".join(errors))
 
@@ -257,10 +306,27 @@ class Kimura:
         buf[0] = self.report_id
         buf[1] = opcode
         buf[2:2 + len(payload)] = payload
-        self.dev.send_feature_report(bytes(buf))
+        try:
+            self.dev.send_feature_report(bytes(buf))
+        except Exception as e:
+            # CONFIRMED (real macOS hardware, 2026-09-24): hidapi's
+            # get_feature_report()/send_feature_report() can raise a raw
+            # OSError ("read error") straight from the C extension, not a
+            # KimuraError — every caller up the stack (including the GUI's
+            # `except k.KimuraError` handlers, and read_dpi_stage()'s own
+            # try/except) only catches KimuraError, so an uncaught OSError
+            # here crashes whatever Tk callback triggered it instead of
+            # showing a clean error/being retried. Normalize here so every
+            # caller gets one consistent, catchable exception type.
+            log.error("feature-report write failed (opcode=0x%02X): %s", opcode, e)
+            raise KimuraError("feature-report write failed: %s" % e)
 
     def _rx(self):
-        data = self.dev.get_feature_report(self.report_id, self.feature_len)
+        try:
+            data = self.dev.get_feature_report(self.report_id, self.feature_len)
+        except Exception as e:
+            log.error("feature-report read failed: %s", e)
+            raise KimuraError("feature-report read failed: %s" % e)
         return bytes(data)
 
     def _tx_output(self, payload32):
@@ -295,6 +361,7 @@ class Kimura:
         buf = bytes([self.report_id]) + bytes(payload32)
 
         if sys.platform == "darwin":
+            log.warning("page-data write refused on macOS (by design — see docstring)")
             raise KimuraError(
                 "page-data write refused on macOS: this firmware only accepts "
                 "button/LED table writes via a control-plane USB request, which "
@@ -396,10 +463,12 @@ class Kimura:
                 "refusing to send unconfirmed LED preset 0x%02X — only %s "
                 "are confirmed safe (see PROTOCOL.md §4.3)"
                 % (preset, ", ".join("0x%02X" % p for p in sorted(LED_PRESETS))))
+        log.info("set_led(preset=0x%02X, persist=%s)", preset, persist)
         if persist:
             self.apply_button_table({}, led_preset=preset)
         else:
             self.command(OP_LED, bytes([preset]), expect_reply=False)
+        log.info("set_led(preset=0x%02X, persist=%s) OK", preset, persist)
 
     def apply_button_table(self, overrides, led_preset=None):
         """EXPERIMENTAL — sends the full 11-step "apply settings" bundle
@@ -444,6 +513,8 @@ class Kimura:
         if led not in LED_PRESETS:
             raise KimuraError("refusing unconfirmed LED preset 0x%02X" % led)
 
+        log.info("apply_button_table(overrides=%r, led_preset=0x%02X) starting",
+                sorted(overrides), led)
         # Exact 11-step order from PROTOCOL.md §4.3a. Deviating from this
         # order is untested territory on top of already-untested territory.
         self.command(OP_APPLY_BEGIN, expect_reply=False)
@@ -457,6 +528,7 @@ class Kimura:
         self.command(OP_UNKNOWN_01, bytes([0x08, 0, 0, 0, 0, 0]), expect_reply=False)
         self.command(OP_UNKNOWN_06, bytes([0, 0, 0, 0, 0, 0]), expect_reply=False)
         self.command(OP_COMMIT, expect_reply=False)
+        log.info("apply_button_table(...) committed to flash OK")
 
 
 # --- discovery ---------------------------------------------------------------
@@ -965,6 +1037,7 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Found a bug or unexpected behavior? Report it: %s" % ISSUE_URL)
+    p.add_argument("--version", action="version", version="kimura %s" % __version__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pl = sub.add_parser("list", help="list all 0x248A HID interfaces")
@@ -1027,6 +1100,7 @@ def main():
     pfr.set_defaults(func=cmd_factory_reset)
 
     args = p.parse_args()
+    print("kimura %s" % __version__, file=sys.stderr)
     return args.func(args)
 
 

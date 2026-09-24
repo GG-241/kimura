@@ -21,6 +21,7 @@ import importlib.resources
 import queue
 import sys
 import time
+import traceback
 import webbrowser
 
 try:
@@ -127,6 +128,7 @@ class KimuraGUI(ctk.CTk):
         self._closed = False
 
         self._build_layout()
+        self.report_callback_exception = self._log_callback_exception
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # System tray icon (optional — degrades to no-op if unavailable, see
@@ -156,9 +158,11 @@ class KimuraGUI(ctk.CTk):
         ctk.CTkLabel(sidebar, text="Kimura", font=ctk.CTkFont(size=22, weight="bold"),
                     text_color=ACCENT).grid(row=0, column=0, padx=20, pady=(24, 0), sticky="w")
         ctk.CTkLabel(sidebar, text="v3.0 (MS-4300WG)", font=ctk.CTkFont(size=11),
-                    text_color="gray60").grid(row=1, column=0, padx=20, pady=(0, 24), sticky="w")
+                    text_color="gray60").grid(row=1, column=0, padx=20, pady=0, sticky="w")
+        ctk.CTkLabel(sidebar, text="App v%s" % k.__version__, font=ctk.CTkFont(size=10),
+                    text_color="gray50").grid(row=2, column=0, padx=20, pady=(0, 24), sticky="w")
 
-        for i, name in enumerate(("Device", "LED", "Button Remap", "Live"), start=2):
+        for i, name in enumerate(("Device", "LED", "Button Remap", "Live"), start=3):
             btn = ctk.CTkButton(sidebar, text=name, anchor="w", corner_radius=8,
                                 fg_color="transparent", text_color=("gray10", "gray90"),
                                 hover_color=("#d3d6fb", "#2a2c4d"),
@@ -256,6 +260,7 @@ class KimuraGUI(ctk.CTk):
                     lines.append("0x%02X  %s" % (op, " ".join("%02X" % b for b in rx[:8])))
             self._set_raw_details_text("\n".join(lines))
         except k.KimuraError as e:
+            k.log.error("Mouse Details refresh failed: %s", e)
             self.mouse_details_var.set("Could not read device details: %s" % e)
             self._set_raw_details_text("")
 
@@ -283,6 +288,7 @@ class KimuraGUI(ctk.CTk):
             messagebox.showinfo("Done", "Factory bundle applied.\n\n"
                                 "Physically verify every button and the LED now.")
         except k.KimuraError as e:
+            k.log.error("Factory Reset failed: %s", e)
             messagebox.showerror("Error", str(e))
 
     def refresh_device(self):
@@ -390,6 +396,7 @@ class KimuraGUI(ctk.CTk):
             self.dev.set_led(preset, persist=True)
             messagebox.showinfo("Sent", "LED preset sent and committed to flash.")
         except k.KimuraError as e:
+            k.log.error("LED Apply failed: %s", e)
             messagebox.showerror("Error", str(e))
 
     # -- Remap page (EXPERIMENTAL) ------------------------------------------
@@ -482,6 +489,7 @@ class KimuraGUI(ctk.CTk):
                                 "Physically test every remapped button now — this write "
                                 "path has no independent verification beyond that.")
         except k.KimuraError as e:
+            k.log.error("Button Remap Apply failed: %s", e)
             messagebox.showerror("Error", str(e))
 
     # -- Live page (read-only) ------------------------------------------
@@ -579,8 +587,22 @@ class KimuraGUI(ctk.CTk):
                 pass
         self.destroy()
 
+    def _log_callback_exception(self, exc_type, exc_value, tb):
+        """Replaces Tk's default report_callback_exception (which only
+        prints to stderr — invisible in the --windowed/frozen builds most
+        users actually run). Logs to ~/.kimura/kimura.log AND still prints,
+        so a Terminal-launched run shows the same thing as before. This is
+        the safety net for any callback exception NOT already caught by a
+        specific `except k.KimuraError` handler — e.g. the DPI-poll crash
+        that motivated this (kimura.py's _tx()/_rx() now normalize hidapi's
+        raw OSErrors into KimuraError, but this stays as defense in depth
+        for anything else that slips through uncaught)."""
+        k.log.error("Uncaught Tkinter callback exception", exc_info=(exc_type, exc_value, tb))
+        traceback.print_exception(exc_type, exc_value, tb)
+
 
 def main():
+    print("kimura-gui %s" % k.__version__, file=sys.stderr)
     app = KimuraGUI()
     app.mainloop()
 

@@ -64,7 +64,7 @@ if [ "$OS" = "Darwin" ]; then
 <dict>
     <key>CFBundleName</key><string>Kimura GUI</string>
     <key>CFBundleExecutable</key><string>kimura-gui-launcher</string>
-    <key>CFBundleIdentifier</key><string>com.kimura-driver.gui</string>
+    <key>CFBundleIdentifier</key><string>com.kimura-driver.gui.devinstall</string>
     <key>CFBundlePackageType</key><string>APPL</string>
 </dict>
 </plist>
@@ -75,6 +75,10 @@ exec "$KIMURA_GUI_BIN"
 LAUNCHER
     chmod +x "$APP_DIR/kimura-gui-launcher"
     echo "Installed \"Kimura GUI.app\" to ~/Applications — open it from Finder/Spotlight."
+    echo "Note: this is a separate copy from any DMG-installed \"Kimura GUI.app\" in"
+    echo "/Applications (see packaging/build_dmg.sh) — if you have both, macOS may not"
+    echo "always launch the one you expect by name; use Get Info (Cmd+I) to check which"
+    echo "one you're opening, or launch by full path to be sure."
 
 elif [ "$OS" = "Linux" ]; then
     "$PIP" install --user . --break-system-packages 2>/dev/null || "$PIP" install --user .
