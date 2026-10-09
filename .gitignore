@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# USB captures / dynamic analysis artifacts
+*.pcap
+*.pcapng
+captures/
+
+# Vendor binaries — not redistributed (see CLAUDE.md "Legal / Provenance")
+*.msi
+*.exe
+*.dll
+driveres_kimura*.zip
